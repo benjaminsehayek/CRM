@@ -1,0 +1,1906 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Crocs &amp; Clicks CRM</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script type="module">
+  import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+  window.__createSupabaseClient = createClient;
+</script>
+
+<style>
+  html, body, #root { height: 100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 4px; }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+  .row-hover:hover { background-color: #f9fafb; }
+  .truncate-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ring-focus:focus { outline: none; box-shadow: 0 0 0 2px #2563eb33; border-color: #2563eb; }
+</style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+<div id="root">
+  <div class="h-full flex items-center justify-center text-gray-500 text-sm">Loading…</div>
+</div>
+
+<script type="text/babel" data-presets="react">
+/* =====================================================================
+   CONFIG
+   ===================================================================== */
+const SUPABASE_URL = 'https://zljokoskuokybdiqqhpy.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_L5Hb-qqsAcN6RLhkdTwYPA_hxPogZiT';
+
+/* =====================================================================
+   ENUM TABLES (kept in sync with abm-crm-schema.sql)
+   ===================================================================== */
+const DEAL_STAGES = [
+  { value: 'target',       label: 'Target',       cls: 'bg-gray-100 text-gray-800' },
+  { value: 'researched',   label: 'Researched',   cls: 'bg-blue-100 text-blue-800' },
+  { value: 'engaged',      label: 'Engaged',      cls: 'bg-indigo-100 text-indigo-800' },
+  { value: 'meeting_set',  label: 'Meeting set',  cls: 'bg-amber-100 text-amber-800' },
+  { value: 'discovery',    label: 'Discovery',    cls: 'bg-purple-100 text-purple-800' },
+  { value: 'proposal',     label: 'Proposal',     cls: 'bg-teal-100 text-teal-800' },
+  { value: 'pilot',        label: 'Pilot',        cls: 'bg-cyan-100 text-cyan-800' },
+  { value: 'closed_won',   label: 'Closed won',   cls: 'bg-green-100 text-green-800' },
+  { value: 'closed_lost',  label: 'Closed lost',  cls: 'bg-red-100 text-red-800' },
+];
+
+const FIT_SCORES = [
+  { value: 'a',       label: 'A', cls: 'bg-green-100 text-green-800' },
+  { value: 'b',       label: 'B', cls: 'bg-emerald-100 text-emerald-800' },
+  { value: 'c',       label: 'C', cls: 'bg-amber-100 text-amber-800' },
+  { value: 'd',       label: 'D', cls: 'bg-red-100 text-red-800' },
+  { value: 'unrated', label: 'Unrated', cls: 'bg-gray-100 text-gray-600' },
+];
+
+const INDUSTRIES = [
+  ['auto_body','Auto body'], ['auto_repair','Auto repair'], ['paint','Paint'],
+  ['electrical','Electrical'], ['plumbing','Plumbing'], ['hvac','HVAC'],
+  ['roofing','Roofing'], ['remodeling','Remodeling / GC'], ['landscaping','Landscaping'],
+  ['janitorial','Janitorial'], ['flooring','Flooring'], ['concrete','Concrete'],
+  ['fence_deck','Fence & deck'], ['pest_control','Pest control'], ['pool_spa','Pool & spa'],
+  ['garage_door','Garage door'], ['window_door','Window & door'], ['solar','Solar'],
+  ['tree_service','Tree service'], ['cleaning','Cleaning'], ['powersports','Powersports'],
+  ['other','Other'],
+].map(([value, label]) => ({ value, label }));
+
+const MARKETING_CHANNELS = [
+  ['google_ads','Google Ads'], ['meta_ads','Meta Ads'], ['seo_agency','SEO agency'],
+  ['yelp','Yelp'], ['angi','Angi'], ['homeadvisor','HomeAdvisor'],
+  ['thumbtack','Thumbtack'], ['nextdoor_ads','Nextdoor ads'], ['bni','BNI'],
+  ['chamber','Chamber'], ['direct_mail','Direct mail'], ['radio','Radio'],
+  ['tv','TV'], ['billboard','Billboard'], ['truck_signage','Truck signage'],
+  ['referrals_only','Referrals only'], ['none','None'], ['unknown','Unknown'],
+].map(([value, label]) => ({ value, label }));
+
+const REVENUE_RANGES = [
+  ['under_500k','< $500K'], ['500k_1m','$500K–$1M'], ['1m_3m','$1M–$3M'],
+  ['3m_5m','$3M–$5M'], ['5m_10m','$5M–$10M'], ['over_10m','> $10M'], ['unknown','Unknown'],
+].map(([value, label]) => ({ value, label }));
+
+const EMPLOYEE_RANGES = [
+  ['1_to_3','1–3'], ['4_to_10','4–10'], ['11_to_25','11–25'],
+  ['26_to_50','26–50'], ['51_to_100','51–100'], ['over_100','> 100'], ['unknown','Unknown'],
+].map(([value, label]) => ({ value, label }));
+
+const SPEND_RANGES = [
+  ['under_1k','< $1K'], ['1k_2_5k','$1K–$2.5K'], ['2_5k_5k','$2.5K–$5K'],
+  ['5k_10k','$5K–$10K'], ['10k_25k','$10K–$25K'], ['over_25k','> $25K'], ['unknown','Unknown'],
+].map(([value, label]) => ({ value, label }));
+
+const LEAD_SOURCES = [
+  ['drive_by','Drive-by'], ['gbp_scrape','GBP scrape'],
+  ['referral_client','Referral (client)'], ['referral_other','Referral (other)'],
+  ['chamber','Chamber'], ['association','Association'],
+  ['cold_outbound','Cold outbound'], ['inbound_website','Inbound website'],
+  ['reddit_nextdoor','Reddit / Nextdoor'], ['event','Event'],
+  ['imported_list','Imported list'], ['other','Other'],
+].map(([value, label]) => ({ value, label }));
+
+const ACTIVITY_TYPES = [
+  ['call','Call','📞'], ['email','Email','✉️'], ['sms','SMS','💬'],
+  ['meeting','Meeting','🤝'], ['linkedin','LinkedIn','in'],
+  ['site_visit','Site visit','🚗'], ['proposal','Proposal','📄'], ['note','Note','📝'],
+].map(([value, label, icon]) => ({ value, label, icon }));
+
+const US_STATES = ['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY','DC'];
+
+const COLUMN_DEFS = [
+  { key: 'name',            label: 'Name',           sortable: true,  default: true },
+  { key: 'deal_stage',      label: 'Stage',          sortable: true,  default: true },
+  { key: 'fit',             label: 'Fit',            sortable: true,  default: true },
+  { key: 'industry',        label: 'Industry',       sortable: true,  default: true },
+  { key: 'owner',           label: 'Owner',          sortable: true,  default: true },
+  { key: 'location',        label: 'City, State',    sortable: true,  default: true },
+  { key: 'current_agency',  label: 'Current agency', sortable: false, default: true },
+  { key: 'last_contact',    label: 'Last contact',   sortable: true,  default: true },
+  { key: 'next_contact',    label: 'Next contact',   sortable: true,  default: true },
+  { key: 'meeting',         label: 'Meeting set',    sortable: true,  default: true },
+  { key: 'phone',           label: 'Phone',          sortable: false, default: true },
+  { key: 'revenue',         label: 'Revenue',        sortable: true,  default: false },
+  { key: 'employees',       label: 'Employees',      sortable: true,  default: false },
+  { key: 'spend',           label: 'Monthly spend',  sortable: true,  default: false },
+  { key: 'lead_source',     label: 'Lead source',    sortable: true,  default: false },
+];
+
+/* =====================================================================
+   HELPERS
+   ===================================================================== */
+const supabase = window.__createSupabaseClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const labelFor = (list, value) => (list.find(o => o.value === value)?.label) ?? '';
+const classFor = (list, value) => (list.find(o => o.value === value)?.cls) ?? 'bg-gray-100 text-gray-700';
+
+function digitsOnly(s) { return (s || '').replace(/\D/g, ''); }
+function formatPhone(raw) {
+  const d = digitsOnly(raw);
+  if (d.length === 10) return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+  if (d.length === 11 && d.startsWith('1')) return `(${d.slice(1,4)}) ${d.slice(4,7)}-${d.slice(7)}`;
+  return raw || '';
+}
+function normalizeDomain(url) {
+  if (!url) return '';
+  return url.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split(/[/?#]/)[0];
+}
+function relativeTime(input) {
+  if (!input) return '—';
+  const d = new Date(input);
+  if (isNaN(d)) return '—';
+  const secs = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return `${Math.floor(secs/60)}m ago`;
+  if (secs < 86400) return `${Math.floor(secs/3600)}h ago`;
+  if (secs < 86400*30) return `${Math.floor(secs/86400)}d ago`;
+  if (secs < 86400*365) return `${Math.floor(secs/86400/30)}mo ago`;
+  return `${Math.floor(secs/86400/365)}y ago`;
+}
+function fmtDate(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (isNaN(dt)) return d;
+  return dt.toISOString().slice(0,10);
+}
+function fmtDateTime(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (isNaN(dt)) return d;
+  return dt.toLocaleString();
+}
+function todayISO() { return new Date().toISOString().slice(0,10); }
+function daysFromNow(iso) {
+  if (!iso) return null;
+  const ms = new Date(iso + 'T00:00:00').getTime() - new Date(todayISO() + 'T00:00:00').getTime();
+  return Math.round(ms / 86400000);
+}
+function classNames(...xs) { return xs.filter(Boolean).join(' '); }
+function safe(v) { return (v === null || v === undefined) ? '' : v; }
+function uniq(arr) { return Array.from(new Set(arr)); }
+
+/* =====================================================================
+   APP STATE — Context + useReducer
+   ===================================================================== */
+const { useState, useEffect, useMemo, useReducer, useRef, useCallback, createContext, useContext } = React;
+
+const initialState = {
+  authReady: false,
+  user: null,             // auth user
+  profile: null,          // profiles row for current user
+  profiles: [],           // all users
+  accounts: [],
+  contacts: {},           // accountId -> [contacts]
+  activities: {},         // accountId -> [activities]
+  filters: {
+    stages: [], owners: [], fits: [], industries: [], states: [],
+    cityContains: '', servicesContains: '',
+    revenueRanges: [], employeeRanges: [], channels: [], spendRanges: [],
+    agencyContains: '', meetingSet: 'any',
+    lastContact: 'any', nextContact: 'any',
+    leadSources: [], search: '',
+  },
+  sort: { field: 'updated_at', dir: 'desc' },
+  selectedIds: [],
+  columnVisibility: COLUMN_DEFS.reduce((m,c) => (m[c.key] = !!c.default, m), {}),
+  loading: false,
+  toast: null,
+  modal: null,
+  modalProps: {},
+  savedViews: [],
+  route: parseHash(window.location.hash),
+};
+
+function parseHash(hash) {
+  const h = (hash || '').replace(/^#\/?/, '');
+  if (!h || h === 'accounts') return { name: 'list' };
+  const m = h.match(/^accounts\/([0-9a-fA-F-]{36})$/);
+  if (m) return { name: 'detail', accountId: m[1] };
+  return { name: 'list' };
+}
+
+function appReducer(state, action) {
+  switch (action.type) {
+    case 'AUTH_READY':       return { ...state, authReady: true, user: action.user, profile: action.profile };
+    case 'SET_PROFILE':      return { ...state, profile: action.profile };
+    case 'SET_PROFILES':     return { ...state, profiles: action.profiles };
+    case 'LOAD_ACCOUNTS':    return { ...state, accounts: action.accounts };
+    case 'UPSERT_ACCOUNT': {
+      const i = state.accounts.findIndex(a => a.id === action.account.id);
+      const next = state.accounts.slice();
+      if (i >= 0) next[i] = { ...next[i], ...action.account };
+      else next.unshift(action.account);
+      return { ...state, accounts: next };
+    }
+    case 'REMOVE_ACCOUNT':   return { ...state, accounts: state.accounts.filter(a => a.id !== action.id) };
+    case 'SET_FILTERS':      return { ...state, filters: { ...state.filters, ...action.filters } };
+    case 'RESET_FILTERS':    return { ...state, filters: initialState.filters };
+    case 'SET_SORT':         return { ...state, sort: action.sort };
+    case 'TOGGLE_SELECT': {
+      const has = state.selectedIds.includes(action.id);
+      return { ...state, selectedIds: has ? state.selectedIds.filter(x => x !== action.id) : [...state.selectedIds, action.id] };
+    }
+    case 'SET_SELECTION':    return { ...state, selectedIds: action.ids };
+    case 'CLEAR_SELECTION':  return { ...state, selectedIds: [] };
+    case 'SET_COLS':         return { ...state, columnVisibility: action.cols };
+    case 'SET_LOADING':      return { ...state, loading: action.loading };
+    case 'SET_TOAST':        return { ...state, toast: action.toast };
+    case 'OPEN_MODAL':       return { ...state, modal: action.modal, modalProps: action.props || {} };
+    case 'CLOSE_MODAL':      return { ...state, modal: null, modalProps: {} };
+    case 'LOAD_CONTACTS':    return { ...state, contacts: { ...state.contacts, [action.accountId]: action.contacts } };
+    case 'LOAD_ACTIVITIES':  return { ...state, activities: { ...state.activities, [action.accountId]: action.activities } };
+    case 'ADD_CONTACT': {
+      const arr = state.contacts[action.contact.account_id] || [];
+      return { ...state, contacts: { ...state.contacts, [action.contact.account_id]: [...arr, action.contact] } };
+    }
+    case 'UPDATE_CONTACT': {
+      const arr = state.contacts[action.contact.account_id] || [];
+      return { ...state, contacts: { ...state.contacts, [action.contact.account_id]: arr.map(c => c.id === action.contact.id ? action.contact : c) } };
+    }
+    case 'REMOVE_CONTACT': {
+      const arr = state.contacts[action.accountId] || [];
+      return { ...state, contacts: { ...state.contacts, [action.accountId]: arr.filter(c => c.id !== action.id) } };
+    }
+    case 'ADD_ACTIVITY': {
+      const arr = state.activities[action.activity.account_id] || [];
+      return { ...state, activities: { ...state.activities, [action.activity.account_id]: [action.activity, ...arr] } };
+    }
+    case 'SET_SAVED_VIEWS':  return { ...state, savedViews: action.views };
+    case 'SET_ROUTE':        return { ...state, route: action.route };
+    case 'APPLY_VIEW':       return { ...state, filters: { ...initialState.filters, ...action.filters }, sort: action.sort || state.sort };
+    default: return state;
+  }
+}
+
+const AppCtx = createContext(null);
+const useApp = () => useContext(AppCtx);
+
+/* =====================================================================
+   UI ATOMS
+   ===================================================================== */
+function Pill({ children, className }) {
+  return <span className={classNames('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium', className)}>{children}</span>;
+}
+
+function Button({ children, variant='primary', size='md', className, ...rest }) {
+  const variants = {
+    primary: 'bg-blue-600 text-white hover:bg-blue-700',
+    secondary: 'bg-white text-gray-800 border border-gray-300 hover:bg-gray-50',
+    danger: 'bg-red-600 text-white hover:bg-red-700',
+    ghost: 'text-gray-700 hover:bg-gray-100',
+  };
+  const sizes = { sm: 'px-2.5 py-1 text-xs', md: 'px-3 py-1.5 text-sm', lg: 'px-4 py-2 text-sm' };
+  return (
+    <button {...rest} className={classNames('rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed', variants[variant], sizes[size], className)}>
+      {children}
+    </button>
+  );
+}
+
+function Input({ label, error, className, ...rest }) {
+  return (
+    <label className="block">
+      {label && <span className="block text-xs font-medium text-gray-700 mb-1">{label}</span>}
+      <input {...rest} className={classNames('w-full px-2.5 py-1.5 text-sm border border-gray-300 rounded ring-focus', className)} />
+      {error && <span className="block text-xs text-red-600 mt-1">{error}</span>}
+    </label>
+  );
+}
+
+function Textarea({ label, ...rest }) {
+  return (
+    <label className="block">
+      {label && <span className="block text-xs font-medium text-gray-700 mb-1">{label}</span>}
+      <textarea {...rest} className="w-full px-2.5 py-1.5 text-sm border border-gray-300 rounded ring-focus" />
+    </label>
+  );
+}
+
+function Select({ label, options, includeBlank, blankLabel='—', ...rest }) {
+  return (
+    <label className="block">
+      {label && <span className="block text-xs font-medium text-gray-700 mb-1">{label}</span>}
+      <select {...rest} className="w-full px-2.5 py-1.5 text-sm border border-gray-300 rounded bg-white ring-focus">
+        {includeBlank && <option value="">{blankLabel}</option>}
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </label>
+  );
+}
+
+function MultiCheckGroup({ label, options, values, onChange }) {
+  function toggle(v) {
+    onChange(values.includes(v) ? values.filter(x => x !== v) : [...values, v]);
+  }
+  return (
+    <div>
+      <div className="text-xs font-medium text-gray-700 mb-1">{label}</div>
+      <div className="space-y-1 max-h-40 overflow-y-auto scrollbar-thin pr-1 border border-gray-200 rounded p-1.5 bg-white">
+        {options.map(o => (
+          <label key={o.value} className="flex items-center gap-2 text-sm text-gray-800 cursor-pointer">
+            <input type="checkbox" checked={values.includes(o.value)} onChange={() => toggle(o.value)} />
+            <span>{o.label}</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Toast() {
+  const { state, dispatch } = useApp();
+  useEffect(() => {
+    if (!state.toast) return;
+    const t = setTimeout(() => dispatch({ type: 'SET_TOAST', toast: null }), 4000);
+    return () => clearTimeout(t);
+  }, [state.toast]);
+  if (!state.toast) return null;
+  const tone = state.toast.kind === 'error' ? 'bg-red-600' : state.toast.kind === 'warn' ? 'bg-amber-600' : 'bg-gray-900';
+  return (
+    <div className="fixed top-4 right-4 z-50">
+      <div className={classNames('text-white text-sm px-3.5 py-2 rounded shadow-lg max-w-sm', tone)}>
+        {state.toast.text}
+      </div>
+    </div>
+  );
+}
+
+function notify(dispatch, text, kind='ok') {
+  dispatch({ type: 'SET_TOAST', toast: { text, kind } });
+}
+
+function Modal({ open, onClose, title, children, width='max-w-lg' }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-40 flex items-start justify-center bg-black/40 overflow-y-auto py-10 px-4" onClick={onClose}>
+      <div className={classNames('bg-white rounded-lg shadow-xl w-full', width)} onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200">
+          <h2 className="text-base font-semibold text-gray-900">{title}</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
+        </div>
+        <div className="p-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
+   AUTH
+   ===================================================================== */
+function LoginView() {
+  const { dispatch } = useApp();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  async function submit(e) {
+    e.preventDefault();
+    setBusy(true); setErr('');
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    setBusy(false);
+    if (error) setErr(error.message);
+  }
+
+  return (
+    <div className="h-full flex items-center justify-center px-4">
+      <form onSubmit={submit} className="w-full max-w-sm bg-white rounded-lg shadow border border-gray-200 p-6 space-y-4">
+        <div>
+          <h1 className="text-lg font-semibold text-gray-900">Crocs &amp; Clicks CRM</h1>
+          <p className="text-xs text-gray-500 mt-0.5">Sign in to continue</p>
+        </div>
+        <Input label="Email" type="email" value={email} onChange={e => setEmail(e.target.value)} required autoFocus />
+        <Input label="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} required />
+        {err && <div className="text-xs text-red-600">{err}</div>}
+        <Button type="submit" disabled={busy} className="w-full justify-center">{busy ? 'Signing in…' : 'Sign in'}</Button>
+        <p className="text-xs text-gray-500">Accounts are created by an admin in Supabase.</p>
+      </form>
+    </div>
+  );
+}
+
+/* =====================================================================
+   TOP BAR
+   ===================================================================== */
+function TopBar() {
+  const { state, dispatch } = useApp();
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  function goList() { window.location.hash = '#/accounts'; }
+
+  return (
+    <div className="bg-white border-b border-gray-200 px-4 py-2 flex items-center gap-3">
+      <button onClick={goList} className="font-semibold text-gray-900 hover:text-gray-700 text-sm">
+        Crocs &amp; Clicks CRM
+      </button>
+      <div className="flex-1 max-w-xl">
+        <input
+          type="text"
+          placeholder="Search accounts (name, phone, website, street)…   /"
+          value={state.filters.search}
+          onChange={e => dispatch({ type: 'SET_FILTERS', filters: { search: e.target.value } })}
+          className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded ring-focus"
+          id="global-search"
+        />
+      </div>
+      <div className="ml-auto flex items-center gap-2">
+        <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'import' })}>Import CSV</Button>
+        <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'add_account' })}>New account</Button>
+        <div className="relative">
+          <button onClick={() => setMenuOpen(v => !v)} className="w-8 h-8 rounded-full bg-blue-600 text-white text-xs font-semibold flex items-center justify-center" title={state.profile?.full_name}>
+            {(state.profile?.full_name || '?').slice(0,2).toUpperCase()}
+          </button>
+          {menuOpen && (
+            <div className="absolute right-0 top-9 bg-white border border-gray-200 rounded shadow-md min-w-[200px] z-30">
+              <div className="px-3 py-2 border-b border-gray-200">
+                <div className="text-sm font-medium text-gray-900">{state.profile?.full_name}</div>
+                <div className="text-xs text-gray-500">{state.profile?.role}</div>
+              </div>
+              <button className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50" onClick={async () => { await supabase.auth.signOut(); setMenuOpen(false); }}>
+                Sign out
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
+   FILTER PANEL
+   ===================================================================== */
+function FilterPanel() {
+  const { state, dispatch } = useApp();
+  const [open, setOpen] = useState(true);
+  const f = state.filters;
+  const set = (patch) => dispatch({ type: 'SET_FILTERS', filters: patch });
+
+  return (
+    <div className={classNames('border-r border-gray-200 bg-white transition-all', open ? 'w-72' : 'w-10')}>
+      <div className="flex items-center justify-between p-2 border-b border-gray-200">
+        <button onClick={() => setOpen(o => !o)} className="text-sm font-medium text-gray-700">{open ? 'Filters' : '☰'}</button>
+        {open && (
+          <button onClick={() => dispatch({ type: 'RESET_FILTERS' })} className="text-xs text-blue-600 hover:underline">Reset</button>
+        )}
+      </div>
+      {open && (
+        <div className="p-3 space-y-3 overflow-y-auto scrollbar-thin" style={{ height: 'calc(100vh - 130px)' }}>
+          <MultiCheckGroup label="Stage" options={DEAL_STAGES} values={f.stages} onChange={v => set({ stages: v })} />
+          <MultiCheckGroup label="Fit" options={FIT_SCORES} values={f.fits} onChange={v => set({ fits: v })} />
+          <MultiCheckGroup label="Owner" options={state.profiles.map(p => ({ value: p.id, label: p.full_name }))} values={f.owners} onChange={v => set({ owners: v })} />
+          <MultiCheckGroup label="Industry" options={INDUSTRIES} values={f.industries} onChange={v => set({ industries: v })} />
+          <MultiCheckGroup label="State" options={US_STATES.map(s => ({ value: s, label: s }))} values={f.states} onChange={v => set({ states: v })} />
+          <Input label="City contains" value={f.cityContains} onChange={e => set({ cityContains: e.target.value })} />
+          <Input label="Services contains" value={f.servicesContains} onChange={e => set({ servicesContains: e.target.value })} />
+          <MultiCheckGroup label="Annual revenue" options={REVENUE_RANGES} values={f.revenueRanges} onChange={v => set({ revenueRanges: v })} />
+          <MultiCheckGroup label="Employee count" options={EMPLOYEE_RANGES} values={f.employeeRanges} onChange={v => set({ employeeRanges: v })} />
+          <MultiCheckGroup label="Currently using" options={MARKETING_CHANNELS} values={f.channels} onChange={v => set({ channels: v })} />
+          <MultiCheckGroup label="Monthly marketing spend" options={SPEND_RANGES} values={f.spendRanges} onChange={v => set({ spendRanges: v })} />
+          <Input label="Current agency contains" value={f.agencyContains} onChange={e => set({ agencyContains: e.target.value })} />
+          <Select label="Has meeting set" value={f.meetingSet} onChange={e => set({ meetingSet: e.target.value })}
+                  options={[{value:'any',label:'Any'},{value:'yes',label:'Yes'},{value:'no',label:'No'}]} />
+          <Select label="Last contact" value={f.lastContact} onChange={e => set({ lastContact: e.target.value })}
+                  options={[
+                    {value:'any',label:'Any'},
+                    {value:'7',label:'Last 7 days'},
+                    {value:'14',label:'Last 14 days'},
+                    {value:'30',label:'Last 30 days'},
+                    {value:'60',label:'Last 60 days'},
+                    {value:'90',label:'Last 90 days'},
+                    {value:'never',label:'Never'},
+                  ]} />
+          <Select label="Next contact" value={f.nextContact} onChange={e => set({ nextContact: e.target.value })}
+                  options={[
+                    {value:'any',label:'Any'},
+                    {value:'today',label:'Today'},
+                    {value:'overdue',label:'Overdue'},
+                    {value:'week',label:'This week'},
+                    {value:'month',label:'This month'},
+                    {value:'none',label:'None scheduled'},
+                  ]} />
+          <MultiCheckGroup label="Lead source" options={LEAD_SOURCES} values={f.leadSources} onChange={v => set({ leadSources: v })} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =====================================================================
+   FILTERING / SORTING
+   ===================================================================== */
+function applyFilters(accounts, f) {
+  const search = f.search.trim().toLowerCase();
+  return accounts.filter(a => {
+    if (a.status !== 'active') return false;
+    if (f.stages.length && !f.stages.includes(a.deal_stage)) return false;
+    if (f.fits.length && !f.fits.includes(a.fit)) return false;
+    if (f.owners.length && !f.owners.includes(a.owner_id)) return false;
+    if (f.industries.length && !f.industries.includes(a.industry)) return false;
+    if (f.states.length && !f.states.includes(a.state)) return false;
+    if (f.cityContains && !(a.city || '').toLowerCase().includes(f.cityContains.toLowerCase())) return false;
+    if (f.servicesContains && !(a.services || '').toLowerCase().includes(f.servicesContains.toLowerCase())) return false;
+    if (f.revenueRanges.length && !f.revenueRanges.includes(a.annual_revenue_range)) return false;
+    if (f.employeeRanges.length && !f.employeeRanges.includes(a.employee_count_range)) return false;
+    if (f.channels.length) {
+      const accCh = a.current_marketing_channels || [];
+      if (!f.channels.some(c => accCh.includes(c))) return false;
+    }
+    if (f.spendRanges.length && !f.spendRanges.includes(a.monthly_marketing_spend_range)) return false;
+    if (f.agencyContains && !(a.current_agency || '').toLowerCase().includes(f.agencyContains.toLowerCase())) return false;
+    if (f.meetingSet === 'yes' && !a.meeting_set) return false;
+    if (f.meetingSet === 'no' && a.meeting_set) return false;
+    if (f.leadSources.length && !f.leadSources.includes(a.lead_source)) return false;
+    if (f.lastContact !== 'any') {
+      if (f.lastContact === 'never') {
+        if (a.last_contact_date) return false;
+      } else {
+        const cutoff = parseInt(f.lastContact, 10);
+        if (!a.last_contact_date) return false;
+        const diff = (Date.now() - new Date(a.last_contact_date).getTime()) / 86400000;
+        if (diff > cutoff) return false;
+      }
+    }
+    if (f.nextContact !== 'any') {
+      const days = a.next_contact_date ? daysFromNow(a.next_contact_date) : null;
+      if (f.nextContact === 'today' && days !== 0) return false;
+      if (f.nextContact === 'overdue' && (days === null || days >= 0)) return false;
+      if (f.nextContact === 'week' && (days === null || days < 0 || days > 7)) return false;
+      if (f.nextContact === 'month' && (days === null || days < 0 || days > 31)) return false;
+      if (f.nextContact === 'none' && a.next_contact_date) return false;
+    }
+    if (search) {
+      const hay = [a.name, a.phone, a.website, a.street].map(x => (x || '').toLowerCase()).join(' ');
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+const FIT_ORDER = { a: 0, b: 1, c: 2, d: 3, unrated: 4 };
+const STAGE_ORDER = DEAL_STAGES.reduce((m, s, i) => (m[s.value] = i, m), {});
+
+function applySort(accounts, sort, profileMap) {
+  const { field, dir } = sort;
+  const k = dir === 'asc' ? 1 : -1;
+  const get = (a) => {
+    switch (field) {
+      case 'name': return (a.name || '').toLowerCase();
+      case 'deal_stage': return STAGE_ORDER[a.deal_stage] ?? 99;
+      case 'fit': return FIT_ORDER[a.fit] ?? 9;
+      case 'industry': return a.industry || '';
+      case 'owner': return (profileMap[a.owner_id]?.full_name || '').toLowerCase();
+      case 'location': return ((a.state || '') + (a.city || '')).toLowerCase();
+      case 'last_contact': return a.last_contact_date || '';
+      case 'next_contact': return a.next_contact_date || '';
+      case 'meeting': return a.meeting_set ? 1 : 0;
+      case 'revenue': return a.annual_revenue_range || '';
+      case 'employees': return a.employee_count_range || '';
+      case 'spend': return a.monthly_marketing_spend_range || '';
+      case 'lead_source': return a.lead_source || '';
+      default: return a.updated_at || '';
+    }
+  };
+  return accounts.slice().sort((a, b) => {
+    const av = get(a), bv = get(b);
+    if (av < bv) return -1 * k;
+    if (av > bv) return 1 * k;
+    return 0;
+  });
+}
+
+/* =====================================================================
+   ACCOUNTS TABLE
+   ===================================================================== */
+function StagePill({ value }) {
+  return <Pill className={classFor(DEAL_STAGES, value)}>{labelFor(DEAL_STAGES, value)}</Pill>;
+}
+function FitPill({ value }) {
+  return <Pill className={classFor(FIT_SCORES, value)}>{labelFor(FIT_SCORES, value)}</Pill>;
+}
+
+function ColumnsMenu() {
+  const { state, dispatch } = useApp();
+  const [open, setOpen] = useState(false);
+  function toggle(k) {
+    const next = { ...state.columnVisibility, [k]: !state.columnVisibility[k] };
+    dispatch({ type: 'SET_COLS', cols: next });
+    try { localStorage.setItem('crm.cols', JSON.stringify(next)); } catch {}
+  }
+  return (
+    <div className="relative">
+      <Button variant="secondary" size="sm" onClick={() => setOpen(o => !o)}>Columns ⚙</Button>
+      {open && (
+        <div className="absolute right-0 top-9 bg-white border border-gray-200 rounded shadow-md min-w-[220px] z-20 p-2 max-h-80 overflow-y-auto scrollbar-thin">
+          {COLUMN_DEFS.map(c => (
+            <label key={c.key} className="flex items-center gap-2 text-sm py-1 px-1 hover:bg-gray-50 rounded cursor-pointer">
+              <input type="checkbox" checked={!!state.columnVisibility[c.key]} onChange={() => toggle(c.key)} />
+              <span>{c.label}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AccountsTable({ rows }) {
+  const { state, dispatch } = useApp();
+  const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
+  const allSelected = rows.length > 0 && rows.every(r => state.selectedIds.includes(r.id));
+  const cv = state.columnVisibility;
+
+  function sortBy(field) {
+    if (!COLUMN_DEFS.find(c => c.key === field)?.sortable) return;
+    const next = state.sort.field === field
+      ? { field, dir: state.sort.dir === 'asc' ? 'desc' : 'asc' }
+      : { field, dir: 'asc' };
+    dispatch({ type: 'SET_SORT', sort: next });
+  }
+  function openAccount(id) { window.location.hash = `#/accounts/${id}`; }
+
+  function HeaderCell({ k, children, className }) {
+    if (!cv[k]) return null;
+    const sortable = COLUMN_DEFS.find(c => c.key === k)?.sortable;
+    const isSorted = state.sort.field === k;
+    return (
+      <th className={classNames('px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap', sortable && 'cursor-pointer hover:bg-gray-100', className)} onClick={() => sortBy(k)}>
+        {children}{isSorted && <span className="ml-1">{state.sort.dir === 'asc' ? '↑' : '↓'}</span>}
+      </th>
+    );
+  }
+  function Cell({ k, children, className }) {
+    if (!cv[k]) return null;
+    return <td className={classNames('px-3 py-2 text-sm text-gray-800', className)}>{children}</td>;
+  }
+
+  return (
+    <div className="flex-1 overflow-auto scrollbar-thin">
+      <table className="min-w-full border-collapse">
+        <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
+          <tr>
+            <th className="px-3 py-2 w-8">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={() => {
+                  if (allSelected) dispatch({ type: 'CLEAR_SELECTION' });
+                  else dispatch({ type: 'SET_SELECTION', ids: rows.map(r => r.id) });
+                }}
+              />
+            </th>
+            <HeaderCell k="name">Name</HeaderCell>
+            <HeaderCell k="deal_stage">Stage</HeaderCell>
+            <HeaderCell k="fit">Fit</HeaderCell>
+            <HeaderCell k="industry">Industry</HeaderCell>
+            <HeaderCell k="owner">Owner</HeaderCell>
+            <HeaderCell k="location">City, State</HeaderCell>
+            <HeaderCell k="current_agency">Current agency</HeaderCell>
+            <HeaderCell k="last_contact">Last contact</HeaderCell>
+            <HeaderCell k="next_contact">Next contact</HeaderCell>
+            <HeaderCell k="meeting">Meeting set</HeaderCell>
+            <HeaderCell k="phone">Phone</HeaderCell>
+            <HeaderCell k="revenue">Revenue</HeaderCell>
+            <HeaderCell k="employees">Employees</HeaderCell>
+            <HeaderCell k="spend">Monthly spend</HeaderCell>
+            <HeaderCell k="lead_source">Lead source</HeaderCell>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(a => {
+            const owner = profileMap[a.owner_id];
+            const overdue = a.next_contact_date && daysFromNow(a.next_contact_date) < 0;
+            const selected = state.selectedIds.includes(a.id);
+            return (
+              <tr key={a.id} className={classNames('border-b border-gray-100 row-hover', selected && 'bg-blue-50')}>
+                <td className="px-3 py-2">
+                  <input type="checkbox" checked={selected} onChange={() => dispatch({ type: 'TOGGLE_SELECT', id: a.id })} />
+                </td>
+                <Cell k="name">
+                  <button onClick={() => openAccount(a.id)} className="text-blue-700 hover:underline font-medium truncate-cell text-left">
+                    {a.name}
+                  </button>
+                </Cell>
+                <Cell k="deal_stage"><StagePill value={a.deal_stage} /></Cell>
+                <Cell k="fit"><FitPill value={a.fit} /></Cell>
+                <Cell k="industry">
+                  {a.industry && <Pill className="bg-gray-100 text-gray-700">{labelFor(INDUSTRIES, a.industry)}</Pill>}
+                </Cell>
+                <Cell k="owner">
+                  {owner ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-blue-600 text-white text-[10px] font-semibold flex items-center justify-center">
+                        {(owner.full_name || '?').slice(0,2).toUpperCase()}
+                      </span>
+                      <span className="text-xs text-gray-700">{owner.full_name}</span>
+                    </span>
+                  ) : <span className="text-xs text-gray-400">—</span>}
+                </Cell>
+                <Cell k="location" className="whitespace-nowrap">{[a.city, a.state].filter(Boolean).join(', ')}</Cell>
+                <Cell k="current_agency" className="truncate-cell">{a.current_agency}</Cell>
+                <Cell k="last_contact" className="whitespace-nowrap">
+                  <span title={a.last_contact_date || ''}>{a.last_contact_date ? relativeTime(a.last_contact_date) : '—'}</span>
+                </Cell>
+                <Cell k="next_contact" className={classNames('whitespace-nowrap', overdue && 'text-red-600 font-medium')}>
+                  {a.next_contact_date || '—'}
+                </Cell>
+                <Cell k="meeting">
+                  {a.meeting_set ? (
+                    <span className="text-green-700">✓ {a.meeting_at ? fmtDate(a.meeting_at) : ''}</span>
+                  ) : <span className="text-gray-400">—</span>}
+                </Cell>
+                <Cell k="phone">
+                  {a.phone && (
+                    <button onClick={() => { navigator.clipboard.writeText(formatPhone(a.phone)); }} className="hover:text-blue-700" title="Copy">
+                      {formatPhone(a.phone)}
+                    </button>
+                  )}
+                </Cell>
+                <Cell k="revenue">{labelFor(REVENUE_RANGES, a.annual_revenue_range)}</Cell>
+                <Cell k="employees">{labelFor(EMPLOYEE_RANGES, a.employee_count_range)}</Cell>
+                <Cell k="spend">{labelFor(SPEND_RANGES, a.monthly_marketing_spend_range)}</Cell>
+                <Cell k="lead_source">{labelFor(LEAD_SOURCES, a.lead_source)}</Cell>
+              </tr>
+            );
+          })}
+          {rows.length === 0 && (
+            <tr>
+              <td colSpan={20} className="text-center py-16 text-sm text-gray-500">
+                <div className="font-medium text-gray-700 mb-1">No accounts match the current filters.</div>
+                <div className="text-xs">Adjust filters, or <button className="text-blue-600 hover:underline" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'import' })}>import a CSV</button>.</div>
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* =====================================================================
+   BULK ACTIONS
+   ===================================================================== */
+function BulkActionBar({ rows }) {
+  const { state, dispatch } = useApp();
+  const sel = state.selectedIds;
+  if (sel.length === 0) return null;
+
+  async function changeStage(stage) {
+    const { error } = await supabase.from('accounts').update({ deal_stage: stage }).in('id', sel);
+    if (error) return notify(dispatch, error.message, 'error');
+    sel.forEach(id => dispatch({ type: 'UPSERT_ACCOUNT', account: { id, deal_stage: stage } }));
+    notify(dispatch, `Stage updated on ${sel.length} accounts.`);
+  }
+  async function archiveSel() {
+    if (!window.confirm(`Archive ${sel.length} account(s)?`)) return;
+    const { error } = await supabase.from('accounts').update({ status: 'archived' }).in('id', sel);
+    if (error) return notify(dispatch, error.message, 'error');
+    sel.forEach(id => dispatch({ type: 'UPSERT_ACCOUNT', account: { id, status: 'archived' } }));
+    dispatch({ type: 'CLEAR_SELECTION' });
+    notify(dispatch, 'Archived.');
+  }
+  function exportSel() {
+    const subset = rows.filter(r => sel.includes(r.id));
+    const cols = ['name','phone','email','website','street','city','state','zip','industry','services','annual_revenue_range','employee_count_range','current_agency','monthly_marketing_spend_range','competitor_agencies_mentioned','fit','deal_stage','lead_source','last_contact_date','next_contact_date','meeting_set','meeting_at','notes'];
+    const csv = Papa.unparse(subset.map(r => Object.fromEntries(cols.map(c => [c, r[c] ?? '']))));
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `accounts-${todayISO()}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="sticky top-0 z-10 bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center gap-3">
+      <div className="text-sm text-blue-900 font-medium">{sel.length} selected</div>
+      <Select includeBlank blankLabel="Change stage…" value="" onChange={e => e.target.value && changeStage(e.target.value)} options={DEAL_STAGES} />
+      <Button variant="secondary" size="sm" onClick={exportSel}>Export CSV</Button>
+      <Button variant="secondary" size="sm" onClick={archiveSel}>Archive</Button>
+      <button onClick={() => dispatch({ type: 'CLEAR_SELECTION' })} className="ml-auto text-xs text-blue-700 hover:underline">Clear selection</button>
+    </div>
+  );
+}
+
+/* =====================================================================
+   SAVED VIEWS
+   ===================================================================== */
+function SavedViewsBar() {
+  const { state, dispatch } = useApp();
+
+  async function refresh() {
+    const { data } = await supabase.from('saved_views').select('*').order('created_at', { ascending: false });
+    dispatch({ type: 'SET_SAVED_VIEWS', views: data || [] });
+  }
+  useEffect(() => { if (state.profile) refresh(); }, [state.profile?.id]);
+
+  async function saveCurrent() {
+    const name = window.prompt('Name this view:');
+    if (!name) return;
+    const { data, error } = await supabase.from('saved_views').insert({
+      user_id: state.profile.id, name,
+      filters: state.filters,
+      sort_by: state.sort.field,
+      sort_dir: state.sort.dir,
+    }).select().single();
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'SET_SAVED_VIEWS', views: [data, ...state.savedViews] });
+    notify(dispatch, 'View saved.');
+  }
+  async function deleteView(id) {
+    if (!window.confirm('Delete this view?')) return;
+    const { error } = await supabase.from('saved_views').delete().eq('id', id);
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'SET_SAVED_VIEWS', views: state.savedViews.filter(v => v.id !== id) });
+  }
+  function loadView(v) {
+    dispatch({ type: 'APPLY_VIEW', filters: v.filters || {}, sort: v.sort_by ? { field: v.sort_by, dir: v.sort_dir || 'asc' } : null });
+  }
+
+  return (
+    <div className="bg-white border-b border-gray-200 px-4 py-1.5 flex items-center gap-2 overflow-x-auto">
+      <span className="text-xs text-gray-500 font-medium mr-1">Saved views:</span>
+      {state.savedViews.length === 0 && <span className="text-xs text-gray-400 italic">none yet</span>}
+      {state.savedViews.map(v => (
+        <span key={v.id} className="inline-flex items-center gap-1 bg-gray-100 rounded text-xs px-2 py-1">
+          <button onClick={() => loadView(v)} className="font-medium text-gray-800 hover:text-blue-700">{v.name}</button>
+          <button onClick={() => deleteView(v.id)} className="text-gray-400 hover:text-red-600 ml-1" title="Delete">×</button>
+        </span>
+      ))}
+      <button onClick={saveCurrent} className="text-xs text-blue-600 hover:underline ml-auto">+ Save current view</button>
+    </div>
+  );
+}
+
+/* =====================================================================
+   ACCOUNT LIST VIEW
+   ===================================================================== */
+function AccountListView() {
+  const { state, dispatch } = useApp();
+  const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
+  const filtered = useMemo(() => applyFilters(state.accounts, state.filters), [state.accounts, state.filters]);
+  const sorted = useMemo(() => applySort(filtered, state.sort, profileMap), [filtered, state.sort, profileMap]);
+
+  return (
+    <div className="flex flex-1 overflow-hidden">
+      <FilterPanel />
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <SavedViewsBar />
+        <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
+          <span className="text-sm text-gray-600">{sorted.length} account{sorted.length === 1 ? '' : 's'}</span>
+          <div className="ml-auto flex items-center gap-2">
+            <ColumnsMenu />
+          </div>
+        </div>
+        <BulkActionBar rows={sorted} />
+        {state.accounts.length === 0 && !state.loading ? (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="text-center max-w-sm">
+              <div className="text-base font-medium text-gray-800 mb-1">No accounts yet</div>
+              <div className="text-sm text-gray-500 mb-4">Get started by importing your prospecting list or adding an account manually.</div>
+              <div className="flex justify-center gap-2">
+                <Button onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'import' })}>Import your first list</Button>
+                <Button variant="secondary" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'add_account' })}>Add account manually</Button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <AccountsTable rows={sorted} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
+   ACCOUNT DETAIL VIEW
+   ===================================================================== */
+function AccountDetailView({ accountId }) {
+  const { state, dispatch } = useApp();
+  const account = state.accounts.find(a => a.id === accountId);
+  const [tab, setTab] = useState('overview');
+  const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
+
+  useEffect(() => {
+    if (!accountId) return;
+    (async () => {
+      const [c, act] = await Promise.all([
+        supabase.from('contacts').select('*').eq('account_id', accountId).order('is_primary', { ascending: false }).order('created_at', { ascending: true }),
+        supabase.from('activities').select('*').eq('account_id', accountId).order('occurred_at', { ascending: false }),
+      ]);
+      if (c.data) dispatch({ type: 'LOAD_CONTACTS', accountId, contacts: c.data });
+      if (act.data) dispatch({ type: 'LOAD_ACTIVITIES', accountId, activities: act.data });
+    })();
+  }, [accountId]);
+
+  if (!account) {
+    return <div className="p-8 text-sm text-gray-500">Account not found. <a href="#/accounts" className="text-blue-600 hover:underline">Back to list</a></div>;
+  }
+
+  const canEdit = state.profile?.role === 'admin' || account.owner_id === state.profile?.id;
+  const owner = profileMap[account.owner_id];
+  const contacts = state.contacts[accountId] || [];
+  const activities = state.activities[accountId] || [];
+
+  async function archive() {
+    if (!window.confirm('Archive this account?')) return;
+    const { error } = await supabase.from('accounts').update({ status: 'archived' }).eq('id', accountId);
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'UPSERT_ACCOUNT', account: { ...account, status: 'archived' } });
+    window.location.hash = '#/accounts';
+    notify(dispatch, 'Archived.');
+  }
+
+  async function changeOwner() {
+    const opts = state.profiles.map(p => p.full_name).join('\n');
+    const name = window.prompt(`Reassign owner to (enter exact name):\n\n${opts}`);
+    if (!name) return;
+    const target = state.profiles.find(p => p.full_name === name);
+    if (!target) return notify(dispatch, 'No matching user.', 'error');
+    const prevOwner = owner?.full_name || '(unassigned)';
+    const { error } = await supabase.from('accounts').update({ owner_id: target.id }).eq('id', accountId);
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'UPSERT_ACCOUNT', account: { ...account, owner_id: target.id } });
+    await supabase.from('activities').insert({
+      account_id: accountId, user_id: state.profile.id, type: 'note',
+      subject: `Owner changed from ${prevOwner} to ${target.full_name}`,
+    });
+    notify(dispatch, 'Owner updated.');
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto scrollbar-thin">
+      <div className="max-w-6xl mx-auto px-6 py-5">
+        <div className="mb-2">
+          <a href="#/accounts" className="text-sm text-blue-600 hover:underline">← Back to list</a>
+        </div>
+        <div className="flex items-start gap-4 mb-4">
+          <div className="flex-1">
+            <h1 className="text-2xl font-semibold text-gray-900">{account.name}</h1>
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <StagePill value={account.deal_stage} />
+              <FitPill value={account.fit} />
+              {account.industry && <Pill className="bg-gray-100 text-gray-700">{labelFor(INDUSTRIES, account.industry)}</Pill>}
+              {owner && <span className="text-xs text-gray-600">Owner: <span className="font-medium">{owner.full_name}</span></span>}
+              {(account.city || account.state) && <span className="text-xs text-gray-600">{[account.city, account.state].filter(Boolean).join(', ')}</span>}
+              {account.website && <a href={account.website.startsWith('http') ? account.website : `https://${account.website}`} target="_blank" rel="noopener" className="text-xs text-blue-600 hover:underline">{normalizeDomain(account.website)}</a>}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId } })}>Log activity</Button>
+            {canEdit && (
+              <>
+                <Button variant="secondary" size="sm" onClick={changeOwner}>Change owner</Button>
+                <Button variant="secondary" size="sm" onClick={archive}>Archive</Button>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="border-b border-gray-200 flex gap-4 sticky top-0 bg-gray-50 z-10">
+          {['overview','contacts','activity','notes'].map(t => (
+            <button key={t} onClick={() => setTab(t)}
+              className={classNames('px-1 py-2 text-sm font-medium border-b-2',
+                tab === t ? 'border-blue-600 text-blue-700' : 'border-transparent text-gray-600 hover:text-gray-900')}>
+              {t === 'overview' ? 'Overview' : t === 'contacts' ? `Contacts${contacts.length ? ` (${contacts.length})` : ''}` : t === 'activity' ? `Activity${activities.length ? ` (${activities.length})` : ''}` : 'Notes'}
+            </button>
+          ))}
+        </div>
+
+        <div className="py-4">
+          {tab === 'overview' && <OverviewTab account={account} canEdit={canEdit} />}
+          {tab === 'contacts' && <ContactsTab account={account} contacts={contacts} canEdit={canEdit} />}
+          {tab === 'activity' && <ActivityTab account={account} activities={activities} contacts={contacts} />}
+          {tab === 'notes' && <NotesTab account={account} canEdit={canEdit} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
+   OVERVIEW TAB — inline editable fields
+   ===================================================================== */
+function InlineField({ label, value, onSave, type='text', options=null, multi=false, parse=(v) => v, render=null, disabled=false }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value ?? (multi ? [] : ''));
+  useEffect(() => { setDraft(value ?? (multi ? [] : '')); }, [value, multi]);
+
+  async function commit(v) {
+    setEditing(false);
+    const parsed = parse(v);
+    if (JSON.stringify(parsed) === JSON.stringify(value ?? (multi ? [] : ''))) return;
+    await onSave(parsed);
+  }
+
+  if (disabled || !editing) {
+    const displayed = render ? render(value) : (value && value.length !== 0 ? String(value) : <span className="text-gray-400">—</span>);
+    return (
+      <div className="text-sm">
+        <div className="text-xs text-gray-500 mb-0.5">{label}</div>
+        <div onClick={() => !disabled && setEditing(true)} className={classNames('px-2 py-1 -mx-2 rounded', !disabled && 'hover:bg-gray-100 cursor-text')}>
+          {displayed}
+        </div>
+      </div>
+    );
+  }
+
+  if (type === 'select') {
+    return (
+      <div className="text-sm">
+        <div className="text-xs text-gray-500 mb-0.5">{label}</div>
+        <select autoFocus value={draft || ''} onChange={e => setDraft(e.target.value)} onBlur={() => commit(draft || null)}
+          className="w-full px-2 py-1 text-sm border border-gray-300 rounded bg-white ring-focus">
+          <option value="">—</option>
+          {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+      </div>
+    );
+  }
+  if (type === 'multi') {
+    return (
+      <div className="text-sm">
+        <div className="text-xs text-gray-500 mb-0.5">{label}</div>
+        <div className="border border-gray-300 rounded p-1.5 bg-white max-h-44 overflow-y-auto scrollbar-thin">
+          {options.map(o => (
+            <label key={o.value} className="flex items-center gap-2 text-sm py-0.5">
+              <input type="checkbox" checked={draft.includes(o.value)} onChange={() => {
+                const next = draft.includes(o.value) ? draft.filter(x => x !== o.value) : [...draft, o.value];
+                setDraft(next);
+              }} />
+              <span>{o.label}</span>
+            </label>
+          ))}
+          <div className="text-right pt-1">
+            <button onClick={() => commit(draft)} className="text-xs text-blue-600 hover:underline">Done</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (type === 'textarea') {
+    return (
+      <div className="text-sm">
+        <div className="text-xs text-gray-500 mb-0.5">{label}</div>
+        <textarea autoFocus rows={3} value={draft} onChange={e => setDraft(e.target.value)} onBlur={() => commit(draft)}
+          className="w-full px-2 py-1 text-sm border border-gray-300 rounded ring-focus" />
+      </div>
+    );
+  }
+  return (
+    <div className="text-sm">
+      <div className="text-xs text-gray-500 mb-0.5">{label}</div>
+      <input
+        autoFocus
+        type={type}
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={() => commit(draft)}
+        onKeyDown={e => { if (e.key === 'Enter') e.target.blur(); if (e.key === 'Escape') { setDraft(value ?? ''); setEditing(false); } }}
+        className="w-full px-2 py-1 text-sm border border-gray-300 rounded ring-focus"
+      />
+    </div>
+  );
+}
+
+function OverviewTab({ account, canEdit }) {
+  const { state, dispatch } = useApp();
+
+  async function save(patch) {
+    const { error, data } = await supabase.from('accounts').update({ ...patch, updated_by: state.profile.id }).eq('id', account.id).select().single();
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'UPSERT_ACCOUNT', account: data });
+  }
+
+  const Section = ({ title, children }) => (
+    <div className="bg-white border border-gray-200 rounded p-4">
+      <div className="text-sm font-semibold text-gray-900 mb-3">{title}</div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">{children}</div>
+    </div>
+  );
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <Section title="Basics">
+        <InlineField label="Name" value={account.name} onSave={v => save({ name: v })} disabled={!canEdit} />
+        <InlineField label="Phone" value={account.phone} onSave={v => save({ phone: digitsOnly(v) || null })} render={v => v ? formatPhone(v) : null} disabled={!canEdit} />
+        <InlineField label="Email" value={account.email} onSave={v => save({ email: v || null })} type="email" disabled={!canEdit} />
+        <InlineField label="Website" value={account.website} onSave={v => save({ website: v || null })} disabled={!canEdit} />
+        <InlineField label="Street" value={account.street} onSave={v => save({ street: v || null })} disabled={!canEdit} />
+        <InlineField label="City" value={account.city} onSave={v => save({ city: v || null })} disabled={!canEdit} />
+        <InlineField label="State" value={account.state} onSave={v => save({ state: v || null })} type="select" options={US_STATES.map(s => ({ value: s, label: s }))} disabled={!canEdit} />
+        <InlineField label="ZIP" value={account.zip} onSave={v => save({ zip: v || null })} disabled={!canEdit} />
+      </Section>
+
+      <Section title="Qualification">
+        <InlineField label="Industry" value={account.industry} onSave={v => save({ industry: v })} type="select" options={INDUSTRIES} render={v => v ? labelFor(INDUSTRIES, v) : null} disabled={!canEdit} />
+        <InlineField label="Services" value={account.services} onSave={v => save({ services: v || null })} disabled={!canEdit} />
+        <InlineField label="Annual revenue" value={account.annual_revenue_range} onSave={v => save({ annual_revenue_range: v })} type="select" options={REVENUE_RANGES} render={v => v ? labelFor(REVENUE_RANGES, v) : null} disabled={!canEdit} />
+        <InlineField label="Employee count" value={account.employee_count_range} onSave={v => save({ employee_count_range: v })} type="select" options={EMPLOYEE_RANGES} render={v => v ? labelFor(EMPLOYEE_RANGES, v) : null} disabled={!canEdit} />
+        <InlineField label="Fit score" value={account.fit} onSave={v => save({ fit: v || 'unrated' })} type="select" options={FIT_SCORES} render={v => v ? <FitPill value={v} /> : null} disabled={!canEdit} />
+        <InlineField label="Budget range" value={account.budget_range} onSave={v => save({ budget_range: v || null })} disabled={!canEdit} />
+        <InlineField label="Seasonality" value={account.seasonality} onSave={v => save({ seasonality: v || null })} disabled={!canEdit} />
+      </Section>
+
+      <Section title="Marketing posture">
+        <InlineField label="Currently using" value={account.current_marketing_channels || []} onSave={v => save({ current_marketing_channels: v })} type="multi" multi options={MARKETING_CHANNELS}
+          render={v => (v && v.length) ? <div className="flex flex-wrap gap-1">{v.map(c => <Pill key={c} className="bg-indigo-100 text-indigo-800">{labelFor(MARKETING_CHANNELS, c)}</Pill>)}</div> : null}
+          disabled={!canEdit} />
+        <InlineField label="Current agency" value={account.current_agency} onSave={v => save({ current_agency: v || null })} disabled={!canEdit} />
+        <InlineField label="Monthly spend" value={account.monthly_marketing_spend_range} onSave={v => save({ monthly_marketing_spend_range: v })} type="select" options={SPEND_RANGES} render={v => v ? labelFor(SPEND_RANGES, v) : null} disabled={!canEdit} />
+        <InlineField label="Competitor agencies mentioned" value={account.competitor_agencies_mentioned} onSave={v => save({ competitor_agencies_mentioned: v || null })} type="textarea" disabled={!canEdit} />
+      </Section>
+
+      <Section title="Pipeline">
+        <InlineField label="Deal stage" value={account.deal_stage} onSave={v => save({ deal_stage: v })} type="select" options={DEAL_STAGES} render={v => <StagePill value={v} />} disabled={!canEdit} />
+        <InlineField label="Owner" value={account.owner_id} onSave={v => save({ owner_id: v })} type="select" options={state.profiles.map(p => ({ value: p.id, label: p.full_name }))} render={v => state.profiles.find(p => p.id === v)?.full_name} disabled={!canEdit} />
+        <InlineField label="Lead source" value={account.lead_source} onSave={v => save({ lead_source: v })} type="select" options={LEAD_SOURCES} render={v => v ? labelFor(LEAD_SOURCES, v) : null} disabled={!canEdit} />
+        <InlineField label="Last contact" value={account.last_contact_date} disabled render={v => v ? fmtDate(v) : null} />
+        <InlineField label="Next contact" value={account.next_contact_date} onSave={v => save({ next_contact_date: v || null })} type="date" disabled={!canEdit} />
+        <InlineField label="Meeting set" value={account.meeting_set ? 'yes' : 'no'} onSave={v => save({ meeting_set: v === 'yes' })} type="select" options={[{value:'yes',label:'Yes'},{value:'no',label:'No'}]} disabled={!canEdit} />
+        <InlineField label="Meeting at" value={account.meeting_at ? account.meeting_at.slice(0,16) : ''} onSave={v => save({ meeting_at: v ? new Date(v).toISOString() : null })} type="datetime-local" disabled={!canEdit} />
+      </Section>
+    </div>
+  );
+}
+
+/* =====================================================================
+   CONTACTS TAB
+   ===================================================================== */
+function ContactsTab({ account, contacts, canEdit }) {
+  const { state, dispatch } = useApp();
+
+  async function setPrimary(contact) {
+    const { data, error } = await supabase.from('contacts').update({ is_primary: true }).eq('id', contact.id).select().single();
+    if (error) return notify(dispatch, error.message, 'error');
+    // Refresh whole list because trigger may have flipped others
+    const { data: list } = await supabase.from('contacts').select('*').eq('account_id', account.id).order('is_primary', { ascending: false });
+    if (list) dispatch({ type: 'LOAD_CONTACTS', accountId: account.id, contacts: list });
+  }
+  async function remove(contact) {
+    if (!window.confirm(`Delete contact ${contact.first_name} ${contact.last_name || ''}?`)) return;
+    const { error } = await supabase.from('contacts').delete().eq('id', contact.id);
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'REMOVE_CONTACT', id: contact.id, accountId: account.id });
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-sm text-gray-600">{contacts.length} contact{contacts.length === 1 ? '' : 's'}</div>
+        {canEdit && <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'add_contact', props: { accountId: account.id } })}>Add contact</Button>}
+      </div>
+      {contacts.length === 0 ? (
+        <div className="bg-white border border-gray-200 rounded p-8 text-center">
+          <div className="text-sm text-gray-600 mb-3">No contacts yet.</div>
+          {canEdit && <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'add_contact', props: { accountId: account.id } })}>Add a contact</Button>}
+        </div>
+      ) : (
+        <div className="bg-white border border-gray-200 rounded divide-y divide-gray-100">
+          {contacts.map(c => (
+            <div key={c.id} className="px-4 py-3 flex items-start gap-3">
+              <div className="flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-gray-900">{[c.first_name, c.last_name].filter(Boolean).join(' ')}</span>
+                  {c.is_primary && <Pill className="bg-blue-100 text-blue-800">Primary</Pill>}
+                </div>
+                {c.title && <div className="text-xs text-gray-600">{c.title}</div>}
+                <div className="text-xs text-gray-600 mt-1 flex flex-wrap gap-x-4 gap-y-0.5">
+                  {c.email && <a href={`mailto:${c.email}`} className="text-blue-600 hover:underline">{c.email}</a>}
+                  {c.phone && <span>Phone: {formatPhone(c.phone)}</span>}
+                  {c.mobile && <span>Mobile: {formatPhone(c.mobile)}</span>}
+                </div>
+                {c.notes && <div className="text-xs text-gray-700 mt-1.5 whitespace-pre-wrap">{c.notes}</div>}
+              </div>
+              {canEdit && (
+                <div className="flex items-center gap-1">
+                  {!c.is_primary && <Button variant="ghost" size="sm" onClick={() => setPrimary(c)}>Set primary</Button>}
+                  <Button variant="ghost" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'add_contact', props: { accountId: account.id, contact: c } })}>Edit</Button>
+                  <Button variant="ghost" size="sm" onClick={() => remove(c)}>Delete</Button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =====================================================================
+   ACTIVITY TAB
+   ===================================================================== */
+function ActivityTab({ account, activities, contacts }) {
+  const { state, dispatch } = useApp();
+  const [typeFilter, setTypeFilter] = useState('all');
+  const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
+  const filtered = typeFilter === 'all' ? activities : activities.filter(a => a.type === typeFilter);
+  const contactMap = useMemo(() => Object.fromEntries(contacts.map(c => [c.id, c])), [contacts]);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <Select value={typeFilter} onChange={e => setTypeFilter(e.target.value)} options={[{value:'all',label:'All types'}, ...ACTIVITY_TYPES.map(t => ({ value: t.value, label: t.label }))]} />
+        <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId: account.id } })}>Log activity</Button>
+      </div>
+      {filtered.length === 0 ? (
+        <div className="bg-white border border-gray-200 rounded p-8 text-center">
+          <div className="text-sm text-gray-600 mb-3">No activity yet.</div>
+          <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId: account.id } })}>Log the first touch</Button>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {filtered.map(a => {
+            const t = ACTIVITY_TYPES.find(x => x.value === a.type);
+            const contact = a.contact_id ? contactMap[a.contact_id] : null;
+            const user = profileMap[a.user_id];
+            return (
+              <div key={a.id} className="bg-white border border-gray-200 rounded p-3 flex gap-3">
+                <div className="w-8 h-8 rounded bg-gray-100 flex items-center justify-center text-base shrink-0">{t?.icon || '•'}</div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-medium text-gray-900 text-sm">{a.subject}</span>
+                    <Pill className="bg-gray-100 text-gray-700">{t?.label}</Pill>
+                    {contact && <span className="text-xs text-gray-600">with {contact.first_name} {contact.last_name || ''}</span>}
+                  </div>
+                  {a.body && <div className="text-sm text-gray-700 mt-1 whitespace-pre-wrap">{a.body}</div>}
+                  <div className="text-xs text-gray-500 mt-1">
+                    {user?.full_name || 'Unknown'} · <span title={fmtDateTime(a.occurred_at)}>{relativeTime(a.occurred_at)}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =====================================================================
+   NOTES TAB
+   ===================================================================== */
+function NotesTab({ account, canEdit }) {
+  const { state, dispatch } = useApp();
+  const [draft, setDraft] = useState(account.notes || '');
+  useEffect(() => { setDraft(account.notes || ''); }, [account.id, account.notes]);
+
+  async function save() {
+    if ((account.notes || '') === draft) return;
+    const { data, error } = await supabase.from('accounts').update({ notes: draft, updated_by: state.profile.id }).eq('id', account.id).select().single();
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'UPSERT_ACCOUNT', account: data });
+    notify(dispatch, 'Notes saved.');
+  }
+
+  return (
+    <div className="bg-white border border-gray-200 rounded p-4">
+      <textarea
+        rows={16}
+        disabled={!canEdit}
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={save}
+        placeholder="Anything that doesn't fit the structured fields. Saves automatically when you click away."
+        className="w-full px-3 py-2 text-sm border border-gray-300 rounded ring-focus disabled:bg-gray-50"
+      />
+    </div>
+  );
+}
+
+/* =====================================================================
+   ADD ACCOUNT MODAL
+   ===================================================================== */
+function AddAccountModal() {
+  const { state, dispatch } = useApp();
+  const [form, setForm] = useState({
+    name: '', phone: '', email: '', website: '',
+    street: '', city: '', state: '', zip: '',
+    industry: '', services: '',
+    annual_revenue_range: '', employee_count_range: '',
+    current_agency: '', monthly_marketing_spend_range: '',
+    fit: 'unrated', deal_stage: 'target', lead_source: '',
+    owner_id: state.profile?.id || '',
+  });
+  const [busy, setBusy] = useState(false);
+  const set = (k) => (e) => setForm(f => ({ ...f, [k]: e?.target ? e.target.value : e }));
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!form.name.trim()) return notify(dispatch, 'Name is required.', 'error');
+    setBusy(true);
+    const payload = {
+      ...form,
+      name: form.name.trim(),
+      phone: digitsOnly(form.phone) || null,
+      website: form.website || null,
+      industry: form.industry || null,
+      annual_revenue_range: form.annual_revenue_range || null,
+      employee_count_range: form.employee_count_range || null,
+      monthly_marketing_spend_range: form.monthly_marketing_spend_range || null,
+      lead_source: form.lead_source || null,
+      created_by: state.profile.id,
+      updated_by: state.profile.id,
+    };
+    Object.keys(payload).forEach(k => payload[k] === '' && (payload[k] = null));
+    const { data, error } = await supabase.from('accounts').insert(payload).select().single();
+    setBusy(false);
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'UPSERT_ACCOUNT', account: data });
+    dispatch({ type: 'CLOSE_MODAL' });
+    notify(dispatch, 'Account created.');
+    window.location.hash = `#/accounts/${data.id}`;
+  }
+
+  return (
+    <Modal open={true} onClose={() => dispatch({ type: 'CLOSE_MODAL' })} title="New account" width="max-w-2xl">
+      <form onSubmit={submit} className="grid grid-cols-2 gap-3">
+        <div className="col-span-2"><Input label="Name *" value={form.name} onChange={set('name')} required autoFocus /></div>
+        <Input label="Phone" value={form.phone} onChange={set('phone')} />
+        <Input label="Email" type="email" value={form.email} onChange={set('email')} />
+        <div className="col-span-2"><Input label="Website" value={form.website} onChange={set('website')} placeholder="https://example.com" /></div>
+        <div className="col-span-2"><Input label="Street" value={form.street} onChange={set('street')} /></div>
+        <Input label="City" value={form.city} onChange={set('city')} />
+        <Select label="State" value={form.state} onChange={set('state')} options={US_STATES.map(s => ({value:s,label:s}))} includeBlank />
+        <Input label="ZIP" value={form.zip} onChange={set('zip')} />
+        <Select label="Industry" value={form.industry} onChange={set('industry')} options={INDUSTRIES} includeBlank />
+        <Input label="Services (freeform)" value={form.services} onChange={set('services')} />
+        <Select label="Owner" value={form.owner_id} onChange={set('owner_id')} options={state.profiles.map(p => ({ value: p.id, label: p.full_name }))} />
+        <Select label="Annual revenue" value={form.annual_revenue_range} onChange={set('annual_revenue_range')} options={REVENUE_RANGES} includeBlank />
+        <Select label="Employees" value={form.employee_count_range} onChange={set('employee_count_range')} options={EMPLOYEE_RANGES} includeBlank />
+        <Input label="Current agency" value={form.current_agency} onChange={set('current_agency')} />
+        <Select label="Monthly spend" value={form.monthly_marketing_spend_range} onChange={set('monthly_marketing_spend_range')} options={SPEND_RANGES} includeBlank />
+        <Select label="Fit" value={form.fit} onChange={set('fit')} options={FIT_SCORES} />
+        <Select label="Deal stage" value={form.deal_stage} onChange={set('deal_stage')} options={DEAL_STAGES} />
+        <Select label="Lead source" value={form.lead_source} onChange={set('lead_source')} options={LEAD_SOURCES} includeBlank />
+        <div className="col-span-2 flex justify-end gap-2 pt-2 border-t border-gray-200">
+          <Button type="button" variant="secondary" onClick={() => dispatch({ type: 'CLOSE_MODAL' })}>Cancel</Button>
+          <Button type="submit" disabled={busy}>{busy ? 'Saving…' : 'Create account'}</Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/* =====================================================================
+   ADD/EDIT CONTACT MODAL
+   ===================================================================== */
+function ContactModal() {
+  const { state, dispatch } = useApp();
+  const { accountId, contact } = state.modalProps;
+  const editing = !!contact;
+  const [form, setForm] = useState(() => contact ? { ...contact } : {
+    first_name: '', last_name: '', title: '',
+    email: '', phone: '', mobile: '',
+    is_primary: false, notes: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const set = (k) => (e) => setForm(f => ({ ...f, [k]: e?.target ? (e.target.type === 'checkbox' ? e.target.checked : e.target.value) : e }));
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!form.first_name.trim()) return notify(dispatch, 'First name required.', 'error');
+    setBusy(true);
+    const payload = {
+      account_id: accountId,
+      first_name: form.first_name.trim(),
+      last_name: form.last_name?.trim() || null,
+      title: form.title || null,
+      email: form.email || null,
+      phone: digitsOnly(form.phone) || null,
+      mobile: digitsOnly(form.mobile) || null,
+      is_primary: !!form.is_primary,
+      notes: form.notes || null,
+    };
+    let result;
+    if (editing) result = await supabase.from('contacts').update(payload).eq('id', contact.id).select().single();
+    else result = await supabase.from('contacts').insert(payload).select().single();
+    setBusy(false);
+    if (result.error) return notify(dispatch, result.error.message, 'error');
+    // Refresh contacts to handle primary trigger side effects
+    const { data: list } = await supabase.from('contacts').select('*').eq('account_id', accountId).order('is_primary', { ascending: false });
+    if (list) dispatch({ type: 'LOAD_CONTACTS', accountId, contacts: list });
+    dispatch({ type: 'CLOSE_MODAL' });
+    notify(dispatch, editing ? 'Contact updated.' : 'Contact added.');
+  }
+
+  return (
+    <Modal open={true} onClose={() => dispatch({ type: 'CLOSE_MODAL' })} title={editing ? 'Edit contact' : 'Add contact'} width="max-w-xl">
+      <form onSubmit={submit} className="grid grid-cols-2 gap-3">
+        <Input label="First name *" value={form.first_name} onChange={set('first_name')} required autoFocus />
+        <Input label="Last name" value={form.last_name || ''} onChange={set('last_name')} />
+        <div className="col-span-2"><Input label="Title" value={form.title || ''} onChange={set('title')} placeholder="Owner / Manager / Marketing lead" /></div>
+        <Input label="Email" type="email" value={form.email || ''} onChange={set('email')} />
+        <Input label="Phone" value={form.phone || ''} onChange={set('phone')} />
+        <Input label="Mobile" value={form.mobile || ''} onChange={set('mobile')} />
+        <div className="col-span-2">
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={!!form.is_primary} onChange={set('is_primary')} />
+            <span>Primary contact</span>
+          </label>
+        </div>
+        <div className="col-span-2"><Textarea label="Notes" value={form.notes || ''} onChange={set('notes')} rows={3} /></div>
+        <div className="col-span-2 flex justify-end gap-2 pt-2 border-t border-gray-200">
+          <Button type="button" variant="secondary" onClick={() => dispatch({ type: 'CLOSE_MODAL' })}>Cancel</Button>
+          <Button type="submit" disabled={busy}>{busy ? 'Saving…' : (editing ? 'Save' : 'Add contact')}</Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/* =====================================================================
+   LOG ACTIVITY MODAL
+   ===================================================================== */
+function LogActivityModal() {
+  const { state, dispatch } = useApp();
+  const { accountId } = state.modalProps;
+  const account = state.accounts.find(a => a.id === accountId);
+  const contacts = state.contacts[accountId] || [];
+  const [type, setType] = useState('call');
+  const [contactId, setContactId] = useState('');
+  const [subject, setSubject] = useState('');
+  const [body, setBody] = useState('');
+  const [occurredAt, setOccurredAt] = useState(new Date().toISOString().slice(0, 16));
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!subject.trim()) return notify(dispatch, 'Subject required.', 'error');
+    setBusy(true);
+    const { data, error } = await supabase.from('activities').insert({
+      account_id: accountId,
+      contact_id: contactId || null,
+      user_id: state.profile.id,
+      type,
+      subject: subject.trim(),
+      body: body || null,
+      occurred_at: new Date(occurredAt).toISOString(),
+    }).select().single();
+    if (error) { setBusy(false); return notify(dispatch, error.message, 'error'); }
+    dispatch({ type: 'ADD_ACTIVITY', activity: data });
+    // Reflect last_contact_date in local state
+    dispatch({ type: 'UPSERT_ACCOUNT', account: { ...account, last_contact_date: new Date(occurredAt).toISOString().slice(0,10) } });
+
+    if (type === 'meeting' && !account.meeting_set) {
+      if (window.confirm('You logged a meeting. Flip "meeting set" to true on this account?')) {
+        const { data: upd } = await supabase.from('accounts').update({ meeting_set: true, meeting_at: new Date(occurredAt).toISOString() }).eq('id', accountId).select().single();
+        if (upd) dispatch({ type: 'UPSERT_ACCOUNT', account: upd });
+      }
+    }
+    setBusy(false);
+    dispatch({ type: 'CLOSE_MODAL' });
+    notify(dispatch, 'Activity logged.');
+  }
+
+  return (
+    <Modal open={true} onClose={() => dispatch({ type: 'CLOSE_MODAL' })} title={`Log activity${account ? ` — ${account.name}` : ''}`} width="max-w-xl">
+      <form onSubmit={submit} className="space-y-3">
+        <div>
+          <div className="text-xs font-medium text-gray-700 mb-1">Type</div>
+          <div className="flex flex-wrap gap-1.5">
+            {ACTIVITY_TYPES.map(t => (
+              <button type="button" key={t.value}
+                onClick={() => setType(t.value)}
+                className={classNames('px-2.5 py-1 rounded text-xs font-medium border',
+                  type === t.value ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-50')}>
+                <span className="mr-1">{t.icon}</span>{t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <Select label="Contact (optional)" value={contactId} onChange={e => setContactId(e.target.value)}
+                includeBlank blankLabel="Account-level (no specific contact)"
+                options={contacts.map(c => ({ value: c.id, label: `${c.first_name} ${c.last_name || ''}`.trim() }))} />
+        <Input label="Subject *" value={subject} onChange={e => setSubject(e.target.value)} required autoFocus />
+        <Textarea label="Notes" rows={4} value={body} onChange={e => setBody(e.target.value)} placeholder="What happened, next steps…" />
+        <Input label="Occurred at" type="datetime-local" value={occurredAt} onChange={e => setOccurredAt(e.target.value)} />
+        <div className="flex justify-end gap-2 pt-2 border-t border-gray-200">
+          <Button type="button" variant="secondary" onClick={() => dispatch({ type: 'CLOSE_MODAL' })}>Cancel</Button>
+          <Button type="submit" disabled={busy}>{busy ? 'Saving…' : 'Log activity'}</Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/* =====================================================================
+   CSV IMPORT MODAL
+   ===================================================================== */
+const CSV_FIELDS = [
+  { key: '__ignore__', label: '— Ignore —' },
+  { key: 'name', label: 'Name *' },
+  { key: 'phone', label: 'Phone' },
+  { key: 'email', label: 'Email' },
+  { key: 'website', label: 'Website' },
+  { key: 'street', label: 'Street' },
+  { key: 'city', label: 'City' },
+  { key: 'state', label: 'State' },
+  { key: 'zip', label: 'ZIP' },
+  { key: 'industry', label: 'Industry (enum)' },
+  { key: 'services', label: 'Services (freeform)' },
+  { key: 'annual_revenue_range', label: 'Annual revenue (enum)' },
+  { key: 'employee_count_range', label: 'Employees (enum)' },
+  { key: 'current_agency', label: 'Current agency' },
+  { key: 'monthly_marketing_spend_range', label: 'Monthly spend (enum)' },
+  { key: 'competitor_agencies_mentioned', label: 'Competitor agencies' },
+  { key: 'budget_range', label: 'Budget range' },
+  { key: 'seasonality', label: 'Seasonality' },
+  { key: 'lead_source', label: 'Lead source (enum)' },
+  { key: 'notes', label: 'Notes' },
+];
+
+const HEADER_ALIASES = {
+  name: ['name','company','business','biz name','business name','account','account name','company name'],
+  website: ['website','web','url','site','homepage','domain'],
+  phone: ['phone','phone number','telephone','tel','main phone','phone1'],
+  email: ['email','e-mail','email address'],
+  street: ['street','address','address 1','address1','street address'],
+  city: ['city','town'],
+  state: ['state','province','region'],
+  zip: ['zip','postal','zip code','postcode','postal code'],
+  industry: ['industry','category','type','vertical'],
+  services: ['services','offerings'],
+  notes: ['notes','description','comments','remarks'],
+  current_agency: ['agency','current agency','incumbent'],
+};
+
+function autoMap(header) {
+  const norm = header.toLowerCase().replace(/[_\-]+/g, ' ').trim();
+  for (const [field, aliases] of Object.entries(HEADER_ALIASES)) {
+    if (aliases.includes(norm)) return field;
+  }
+  // try field key itself
+  const exact = CSV_FIELDS.find(f => f.key.toLowerCase() === norm);
+  if (exact) return exact.key;
+  return '__ignore__';
+}
+
+function ImportModal() {
+  const { state, dispatch } = useApp();
+  const [step, setStep] = useState(1);
+  const [file, setFile] = useState(null);
+  const [headers, setHeaders] = useState([]);
+  const [rows, setRows] = useState([]);
+  const [mapping, setMapping] = useState({});
+  const [dedup, setDedup] = useState('domain');
+  const [busy, setBusy] = useState(false);
+  const [summary, setSummary] = useState(null);
+
+  function onFile(f) {
+    setFile(f);
+    Papa.parse(f, {
+      header: true, skipEmptyLines: true,
+      complete: (res) => {
+        const hdrs = (res.meta.fields || []).map(h => h.replace(/^﻿/, ''));
+        const data = res.data.map(r => {
+          const o = {};
+          hdrs.forEach(h => { o[h] = (r[h] ?? r['﻿' + h] ?? '').toString().trim(); });
+          return o;
+        });
+        setHeaders(hdrs);
+        setRows(data);
+        const m = {};
+        hdrs.forEach(h => { m[h] = autoMap(h); });
+        setMapping(m);
+        setStep(2);
+      }
+    });
+  }
+
+  function rowToAccount(r) {
+    const out = {};
+    Object.entries(mapping).forEach(([header, field]) => {
+      if (field === '__ignore__') return;
+      let v = (r[header] ?? '').toString().trim();
+      if (!v) return;
+      if (field === 'phone') v = digitsOnly(v);
+      if (field === 'website') v = v.replace(/^https?:\/\//,'').replace(/^www\./,'').replace(/\/+$/,'').toLowerCase();
+      out[field] = v;
+    });
+    return out;
+  }
+
+  const proposed = useMemo(() => rows.map(rowToAccount), [rows, mapping]);
+  const missingName = proposed.filter(p => !p.name).length;
+  const dupesInUpload = useMemo(() => {
+    const seen = new Set(); let n = 0;
+    proposed.forEach(p => {
+      const k = dedup === 'domain' ? normalizeDomain(p.website || '') : digitsOnly(p.phone || '');
+      if (!k) return;
+      if (seen.has(k)) n++; else seen.add(k);
+    });
+    return n;
+  }, [proposed, dedup]);
+
+  async function execute() {
+    setBusy(true);
+    let created = 0, updated = 0, skipped = 0;
+    // Pre-fetch existing accounts to enable fill-empty-only merge
+    const { data: existing } = await supabase.from('accounts').select('id, website_domain, phone, name, owner_id, status').neq('status', 'deleted');
+    const byDomain = new Map();
+    const byPhone = new Map();
+    (existing || []).forEach(a => {
+      if (a.website_domain) byDomain.set(a.website_domain, a);
+      if (a.phone) byPhone.set(a.phone, a);
+    });
+    // Need full existing row to merge fill-empty — fetch lazily per match
+    for (const r of proposed) {
+      if (!r.name) { skipped++; continue; }
+      const key = dedup === 'domain' ? normalizeDomain(r.website || '') : (dedup === 'phone' ? digitsOnly(r.phone || '') : '');
+      const matchStub = dedup === 'domain' ? (key && byDomain.get(key)) : dedup === 'phone' ? (key && byPhone.get(key)) : null;
+      if (matchStub) {
+        const { data: full } = await supabase.from('accounts').select('*').eq('id', matchStub.id).single();
+        if (!full) { skipped++; continue; }
+        const patch = {};
+        Object.entries(r).forEach(([k, v]) => {
+          if (v && (full[k] === null || full[k] === undefined || full[k] === '')) patch[k] = v;
+        });
+        if (Object.keys(patch).length > 0) {
+          patch.updated_by = state.profile.id;
+          const { error } = await supabase.from('accounts').update(patch).eq('id', full.id);
+          if (error) { skipped++; continue; }
+          updated++;
+        } else {
+          skipped++;
+        }
+      } else {
+        const payload = {
+          ...r,
+          owner_id: state.profile.id,
+          lead_source: r.lead_source || 'imported_list',
+          created_by: state.profile.id,
+          updated_by: state.profile.id,
+        };
+        const { error } = await supabase.from('accounts').insert(payload);
+        if (error) { skipped++; continue; }
+        created++;
+      }
+    }
+    await supabase.from('prospect_imports').insert({
+      user_id: state.profile.id,
+      filename: file?.name || 'upload.csv',
+      total_rows: proposed.length, created_count: created, updated_count: updated, skipped_count: skipped,
+    });
+    // reload accounts
+    const { data: all } = await supabase.from('accounts').select('*').neq('status', 'deleted').order('updated_at', { ascending: false });
+    if (all) dispatch({ type: 'LOAD_ACCOUNTS', accounts: all });
+    setSummary({ created, updated, skipped, total: proposed.length });
+    setBusy(false);
+    setStep(4);
+  }
+
+  return (
+    <Modal open={true} onClose={() => dispatch({ type: 'CLOSE_MODAL' })} title="Import accounts from CSV" width="max-w-4xl">
+      {step === 1 && (
+        <div>
+          <label className="block border-2 border-dashed border-gray-300 rounded p-10 text-center cursor-pointer hover:border-blue-400">
+            <input type="file" accept=".csv,text/csv" className="hidden" onChange={e => e.target.files[0] && onFile(e.target.files[0])} />
+            <div className="text-sm text-gray-700 mb-1">Drop a CSV here or click to choose</div>
+            <div className="text-xs text-gray-500">First row should be headers. UTF-8 / UTF-8 BOM both fine.</div>
+          </label>
+        </div>
+      )}
+      {step === 2 && (
+        <div>
+          <div className="text-sm font-medium text-gray-900 mb-2">Map your columns</div>
+          <div className="overflow-x-auto max-h-96 overflow-y-auto scrollbar-thin border border-gray-200 rounded">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 sticky top-0">
+                <tr><th className="px-3 py-2 text-left text-xs text-gray-600">CSV column</th><th className="px-3 py-2 text-left text-xs text-gray-600">Maps to</th><th className="px-3 py-2 text-left text-xs text-gray-600">Sample</th></tr>
+              </thead>
+              <tbody>
+                {headers.map(h => (
+                  <tr key={h} className="border-t border-gray-100">
+                    <td className="px-3 py-1.5 text-xs font-mono text-gray-700">{h}</td>
+                    <td className="px-3 py-1.5">
+                      <select value={mapping[h] || '__ignore__'} onChange={e => setMapping(m => ({ ...m, [h]: e.target.value }))} className="text-xs border border-gray-300 rounded px-1.5 py-1 bg-white">
+                        {CSV_FIELDS.map(f => <option key={f.key} value={f.key}>{f.label}</option>)}
+                      </select>
+                    </td>
+                    <td className="px-3 py-1.5 text-xs text-gray-500 truncate-cell">{(rows[0]?.[h] || '').toString().slice(0,80)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex justify-between mt-3">
+            <Button variant="secondary" onClick={() => setStep(1)}>Back</Button>
+            <Button onClick={() => setStep(3)}>Next: Preview</Button>
+          </div>
+        </div>
+      )}
+      {step === 3 && (
+        <div>
+          <div className="grid grid-cols-2 gap-3 mb-3">
+            <div className="bg-gray-50 border border-gray-200 rounded p-3 text-sm">
+              <div className="font-medium text-gray-900 mb-1">Validation</div>
+              <ul className="text-xs text-gray-700 space-y-0.5">
+                <li>Rows: <span className="font-mono">{proposed.length}</span></li>
+                <li>Missing name (will skip): <span className="font-mono">{missingName}</span></li>
+                <li>Duplicates within upload: <span className="font-mono">{dupesInUpload}</span></li>
+              </ul>
+            </div>
+            <div className="bg-gray-50 border border-gray-200 rounded p-3 text-sm">
+              <div className="font-medium text-gray-900 mb-1">Dedup strategy</div>
+              <label className="flex items-center gap-2 text-sm py-0.5"><input type="radio" checked={dedup === 'domain'} onChange={() => setDedup('domain')} /> Match on normalized website domain (recommended)</label>
+              <label className="flex items-center gap-2 text-sm py-0.5"><input type="radio" checked={dedup === 'phone'} onChange={() => setDedup('phone')} /> Match on phone</label>
+              <label className="flex items-center gap-2 text-sm py-0.5"><input type="radio" checked={dedup === 'none'} onChange={() => setDedup('none')} /> No dedup (create all)</label>
+              <div className="text-xs text-gray-500 mt-1.5">Existing accounts are filled in empty fields only — your data is never overwritten.</div>
+            </div>
+          </div>
+          <div className="text-sm font-medium text-gray-900 mb-1">Preview (first 10)</div>
+          <div className="overflow-x-auto max-h-80 overflow-y-auto scrollbar-thin border border-gray-200 rounded">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50 sticky top-0">
+                <tr>
+                  {Object.values(mapping).filter(v => v !== '__ignore__').filter((v,i,a) => a.indexOf(v) === i).map(field => (
+                    <th key={field} className="px-2 py-1.5 text-left text-gray-600">{CSV_FIELDS.find(f => f.key === field)?.label || field}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {proposed.slice(0,10).map((p, i) => (
+                  <tr key={i} className="border-t border-gray-100">
+                    {Object.values(mapping).filter(v => v !== '__ignore__').filter((v,i,a) => a.indexOf(v) === i).map(field => (
+                      <td key={field} className="px-2 py-1 text-gray-700 truncate-cell">{p[field] || ''}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex justify-between mt-3">
+            <Button variant="secondary" onClick={() => setStep(2)}>Back</Button>
+            <Button disabled={busy} onClick={execute}>{busy ? 'Importing…' : `Import ${proposed.length - missingName} rows`}</Button>
+          </div>
+        </div>
+      )}
+      {step === 4 && summary && (
+        <div className="text-center py-6">
+          <div className="text-lg font-semibold text-gray-900 mb-2">Import complete</div>
+          <div className="text-sm text-gray-700 mb-4">
+            Imported {summary.total} rows: <span className="font-medium">{summary.created} new</span>,{' '}
+            <span className="font-medium">{summary.updated} updated</span>,{' '}
+            <span className="font-medium">{summary.skipped} skipped</span>.
+          </div>
+          <Button onClick={() => dispatch({ type: 'CLOSE_MODAL' })}>Done</Button>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/* =====================================================================
+   APP ROOT
+   ===================================================================== */
+function App() {
+  const [state, dispatch] = useReducer(appReducer, initialState);
+
+  // restore column visibility
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('crm.cols');
+      if (raw) dispatch({ type: 'SET_COLS', cols: { ...initialState.columnVisibility, ...JSON.parse(raw) } });
+    } catch {}
+  }, []);
+
+  // auth bootstrap
+  useEffect(() => {
+    let unsub;
+    (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.user) {
+        const { data: profile } = await supabase.from('profiles').select('*').eq('id', session.user.id).single();
+        dispatch({ type: 'AUTH_READY', user: session.user, profile });
+      } else {
+        dispatch({ type: 'AUTH_READY', user: null, profile: null });
+      }
+      const { data } = supabase.auth.onAuthStateChange(async (event, sess) => {
+        if (sess?.user) {
+          const { data: profile } = await supabase.from('profiles').select('*').eq('id', sess.user.id).single();
+          dispatch({ type: 'AUTH_READY', user: sess.user, profile });
+        } else {
+          dispatch({ type: 'AUTH_READY', user: null, profile: null });
+        }
+      });
+      unsub = data?.subscription;
+    })();
+    return () => unsub?.unsubscribe();
+  }, []);
+
+  // load profiles + accounts after auth
+  useEffect(() => {
+    if (!state.user) return;
+    (async () => {
+      dispatch({ type: 'SET_LOADING', loading: true });
+      const [{ data: profs }, { data: accs }] = await Promise.all([
+        supabase.from('profiles').select('*').order('full_name', { ascending: true }),
+        supabase.from('accounts').select('*').neq('status', 'deleted').order('updated_at', { ascending: false }),
+      ]);
+      if (profs) dispatch({ type: 'SET_PROFILES', profiles: profs });
+      if (accs) dispatch({ type: 'LOAD_ACCOUNTS', accounts: accs });
+      dispatch({ type: 'SET_LOADING', loading: false });
+    })();
+  }, [state.user?.id]);
+
+  // hash routing
+  useEffect(() => {
+    function onHash() { dispatch({ type: 'SET_ROUTE', route: parseHash(window.location.hash) }); }
+    window.addEventListener('hashchange', onHash);
+    if (!window.location.hash) window.location.hash = '#/accounts';
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  // keyboard shortcuts
+  useEffect(() => {
+    function onKey(e) {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+      if (e.key === '/') { e.preventDefault(); document.getElementById('global-search')?.focus(); }
+      else if (e.key === 'n') { e.preventDefault(); dispatch({ type: 'OPEN_MODAL', modal: 'add_account' }); }
+      else if (e.key === 'i') { e.preventDefault(); dispatch({ type: 'OPEN_MODAL', modal: 'import' }); }
+      else if (e.key === 'Escape') { dispatch({ type: 'CLOSE_MODAL' }); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  const ctx = useMemo(() => ({ state, dispatch }), [state]);
+
+  if (!state.authReady) {
+    return <div className="h-full flex items-center justify-center text-sm text-gray-500">Loading…</div>;
+  }
+  if (!state.user || !state.profile) {
+    return (
+      <AppCtx.Provider value={ctx}>
+        <LoginView />
+        <Toast />
+      </AppCtx.Provider>
+    );
+  }
+
+  return (
+    <AppCtx.Provider value={ctx}>
+      <div className="h-full flex flex-col">
+        <TopBar />
+        {state.route.name === 'list'
+          ? <AccountListView />
+          : <AccountDetailView accountId={state.route.accountId} />}
+      </div>
+      {state.modal === 'add_account' && <AddAccountModal />}
+      {state.modal === 'add_contact' && <ContactModal />}
+      {state.modal === 'log_activity' && <LogActivityModal />}
+      {state.modal === 'import' && <ImportModal />}
+      <Toast />
+    </AppCtx.Provider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
