@@ -8,15 +8,11 @@
 -- -------------------------------------------------------------------------
 
 create type deal_stage as enum (
-  'target',
-  'researched',
-  'engaged',
+  'prospect',
   'meeting_set',
-  'discovery',
-  'proposal',
-  'pilot',
-  'closed_won',
-  'closed_lost'
+  'discovery_complete',
+  'opportunity_won',
+  'opportunity_lost'
 );
 
 create type account_status as enum (
@@ -180,7 +176,7 @@ create table accounts (
   fit fit_score not null default 'unrated',
 
   -- pipeline
-  deal_stage deal_stage not null default 'target',
+  deal_stage deal_stage not null default 'prospect',
   status account_status not null default 'active',
 
   -- cadence

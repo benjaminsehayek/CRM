@@ -42,15 +42,11 @@ const SUPABASE_ANON_KEY = 'sb_publishable_L5Hb-qqsAcN6RLhkdTwYPA_hxPogZiT';
    ENUM TABLES (kept in sync with abm-crm-schema.sql)
    ===================================================================== */
 const DEAL_STAGES = [
-  { value: 'target',       label: 'Target',       cls: 'bg-gray-100 text-gray-800' },
-  { value: 'researched',   label: 'Researched',   cls: 'bg-blue-100 text-blue-800' },
-  { value: 'engaged',      label: 'Engaged',      cls: 'bg-indigo-100 text-indigo-800' },
-  { value: 'meeting_set',  label: 'Meeting set',  cls: 'bg-amber-100 text-amber-800' },
-  { value: 'discovery',    label: 'Discovery',    cls: 'bg-purple-100 text-purple-800' },
-  { value: 'proposal',     label: 'Proposal',     cls: 'bg-teal-100 text-teal-800' },
-  { value: 'pilot',        label: 'Pilot',        cls: 'bg-cyan-100 text-cyan-800' },
-  { value: 'closed_won',   label: 'Closed won',   cls: 'bg-green-100 text-green-800' },
-  { value: 'closed_lost',  label: 'Closed lost',  cls: 'bg-red-100 text-red-800' },
+  { value: 'prospect',           label: 'Prospect',           cls: 'bg-gray-100 text-gray-800' },
+  { value: 'meeting_set',        label: 'Meeting set',        cls: 'bg-amber-100 text-amber-800' },
+  { value: 'discovery_complete', label: 'Discovery complete', cls: 'bg-purple-100 text-purple-800' },
+  { value: 'opportunity_won',    label: 'Opportunity won',    cls: 'bg-green-100 text-green-800' },
+  { value: 'opportunity_lost',   label: 'Opportunity lost',   cls: 'bg-red-100 text-red-800' },
 ];
 
 const FIT_SCORES = [
