@@ -70,33 +70,25 @@ create type marketing_channel as enum (
 );
 
 create type revenue_range as enum (
-  'under_500k',
-  '500k_1m',
-  '1m_3m',
-  '3m_5m',
-  '5m_10m',
-  'over_10m',
-  'unknown'
+  'under_800k',
+  '800k_3_5m',
+  '3_5m_10m',
+  'over_10m'
 );
 
 create type employee_range as enum (
-  '1_to_3',
-  '4_to_10',
-  '11_to_25',
-  '26_to_50',
-  '51_to_100',
-  'over_100',
-  'unknown'
+  'e_1',
+  'e_2_4',
+  'e_5_12',
+  'e_13_40',
+  'e_over_40'
 );
 
 create type spend_range as enum (
-  'under_1k',
-  '1k_2_5k',
-  '2_5k_5k',
-  '5k_10k',
-  '10k_25k',
-  'over_25k',
-  'unknown'
+  'under_1_5k',
+  '1_5k_5k',
+  '5k_15k',
+  'over_15k'
 );
 
 create type fit_score as enum (
@@ -108,18 +100,10 @@ create type fit_score as enum (
 );
 
 create type lead_source as enum (
-  'drive_by',
   'gbp_scrape',
-  'referral_client',
-  'referral_other',
-  'chamber',
-  'association',
-  'cold_outbound',
-  'inbound_website',
-  'reddit_nextdoor',
-  'event',
-  'imported_list',
-  'other'
+  'yelp_scrape',
+  'meta',
+  'referral'
 );
 
 -- -------------------------------------------------------------------------
