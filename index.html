@@ -1803,7 +1803,8 @@ function AccountDetailView({ accountId }) {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId } })}>Log activity</Button>
+            <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_meeting', props: { accountId } })}>📅 Schedule meeting</Button>
+            <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId } })}>Log activity</Button>
             {canEdit && (
               <>
                 <Button variant="secondary" size="sm" onClick={changeOwner}>Change owner</Button>
