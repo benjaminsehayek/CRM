@@ -225,6 +225,20 @@ create table prospect_imports (
   created_at timestamptz not null default now()
 );
 
+-- tasks: account-level to-dos with due dates
+create table tasks (
+  id uuid primary key default gen_random_uuid(),
+  account_id uuid not null references accounts(id) on delete cascade,
+  assignee_id uuid not null references profiles(id),
+  created_by uuid not null references profiles(id),
+  title text not null,
+  notes text,
+  due_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 -- saved_views: per-user filter presets
 create table saved_views (
   id uuid primary key default gen_random_uuid(),
@@ -261,6 +275,10 @@ create index idx_activities_contact on activities(contact_id);
 create index idx_saved_views_user on saved_views(user_id);
 create index idx_imports_user on prospect_imports(user_id);
 
+create index idx_tasks_account on tasks(account_id);
+create index idx_tasks_assignee_due on tasks(assignee_id, due_at);
+create index idx_tasks_open_due on tasks(due_at) where completed_at is null;
+
 -- -------------------------------------------------------------------------
 -- 4. TRIGGERS
 -- -------------------------------------------------------------------------
@@ -277,6 +295,7 @@ $$ language plpgsql;
 create trigger trg_profiles_updated before update on profiles for each row execute function set_updated_at();
 create trigger trg_accounts_updated before update on accounts for each row execute function set_updated_at();
 create trigger trg_contacts_updated before update on contacts for each row execute function set_updated_at();
+create trigger trg_tasks_updated before update on tasks for each row execute function set_updated_at();
 
 -- auto-update last_contact_date on accounts when activities are logged
 create or replace function update_account_last_contact()
@@ -342,6 +361,7 @@ alter table contacts enable row level security;
 alter table activities enable row level security;
 alter table prospect_imports enable row level security;
 alter table saved_views enable row level security;
+alter table tasks enable row level security;
 
 -- helper: is current user an admin?
 create or replace function is_admin()
@@ -440,6 +460,22 @@ create policy saved_views_all on saved_views
   for all to authenticated
   using (user_id = auth.uid())
   with check (user_id = auth.uid());
+
+-- tasks: read all, write by creator/assignee/admin
+create policy tasks_select on tasks
+  for select to authenticated using (true);
+
+create policy tasks_insert on tasks
+  for insert to authenticated with check (created_by = auth.uid());
+
+create policy tasks_update on tasks
+  for update to authenticated
+  using (created_by = auth.uid() or assignee_id = auth.uid() or is_admin())
+  with check (created_by = auth.uid() or assignee_id = auth.uid() or is_admin());
+
+create policy tasks_delete on tasks
+  for delete to authenticated
+  using (created_by = auth.uid() or is_admin());
 
 -- =========================================================================
 -- POST-MIGRATION STEPS

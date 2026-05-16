@@ -383,12 +383,21 @@ const initialState = {
   },
   contactSort: { field: 'last_name', dir: 'asc' },
   contactSelectedIds: [],
+
+  // Tasks tab — master list across all accounts
+  allTasks: [],
+  taskFilters: {
+    assignees: [], status: 'open', due: 'any', search: '',
+  },
+  taskSort: { field: 'due_at', dir: 'asc' },
+  taskSelectedIds: [],
 };
 
 function parseHash(hash) {
   const h = (hash || '').replace(/^#\/?/, '');
   if (!h || h === 'accounts') return { name: 'list', tab: 'accounts' };
   if (h === 'contacts') return { name: 'list', tab: 'contacts' };
+  if (h === 'tasks') return { name: 'list', tab: 'tasks' };
   if (h === 'calendar') return { name: 'calendar' };
   const m = h.match(/^accounts\/([0-9a-fA-F-]{36})$/);
   if (m) return { name: 'detail', accountId: m[1] };
@@ -463,6 +472,26 @@ function appReducer(state, action) {
     case 'SET_CONTACT_SELECTION':   return { ...state, contactSelectedIds: action.ids };
     case 'CLEAR_CONTACT_SELECTION': return { ...state, contactSelectedIds: [] };
     case 'APPLY_CONTACT_VIEW':      return { ...state, contactFilters: { ...initialState.contactFilters, ...action.filters }, contactSort: action.sort || state.contactSort };
+
+    case 'SET_ALL_TASKS': return { ...state, allTasks: action.tasks };
+    case 'UPSERT_TASK': {
+      const i = state.allTasks.findIndex(t => t.id === action.task.id);
+      const next = state.allTasks.slice();
+      if (i >= 0) next[i] = { ...next[i], ...action.task };
+      else next.unshift(action.task);
+      return { ...state, allTasks: next };
+    }
+    case 'REMOVE_TASK': return { ...state, allTasks: state.allTasks.filter(t => t.id !== action.id) };
+    case 'SET_TASK_FILTERS':   return { ...state, taskFilters: { ...state.taskFilters, ...action.filters } };
+    case 'RESET_TASK_FILTERS': return { ...state, taskFilters: initialState.taskFilters };
+    case 'SET_TASK_SORT':      return { ...state, taskSort: action.sort };
+    case 'TOGGLE_TASK_SELECT': {
+      const has = state.taskSelectedIds.includes(action.id);
+      return { ...state, taskSelectedIds: has ? state.taskSelectedIds.filter(x => x !== action.id) : [...state.taskSelectedIds, action.id] };
+    }
+    case 'SET_TASK_SELECTION':   return { ...state, taskSelectedIds: action.ids };
+    case 'CLEAR_TASK_SELECTION': return { ...state, taskSelectedIds: [] };
+    case 'APPLY_TASK_VIEW':      return { ...state, taskFilters: { ...initialState.taskFilters, ...action.filters }, taskSort: action.sort || state.taskSort };
     case 'APPLY_VIEW':       return { ...state, filters: { ...initialState.filters, ...action.filters }, sort: action.sort || state.sort };
     default: return state;
   }
@@ -1069,7 +1098,11 @@ function ListTabSwitcher() {
   const tab = parseHash(window.location.hash).tab || 'accounts';
   return (
     <div className="bg-white border-b border-gray-200 px-4 py-1.5 flex items-center gap-2">
-      {[{ key: 'accounts', label: 'Accounts' }, { key: 'contacts', label: 'Contacts' }].map(t => (
+      {[
+        { key: 'accounts', label: 'Accounts' },
+        { key: 'contacts', label: 'Contacts' },
+        { key: 'tasks',    label: 'Tasks' },
+      ].map(t => (
         <button key={t.key}
           onClick={() => { window.location.hash = `#/${t.key}`; }}
           className={classNames('px-3 py-1 text-sm font-medium rounded',
@@ -1095,10 +1128,12 @@ function SavedViewsBar({ kind = 'accounts' }) {
   async function saveCurrent() {
     const name = window.prompt('Name this view:');
     if (!name) return;
-    const filters = kind === 'contacts'
-      ? { ...state.contactFilters, _kind: 'contacts' }
-      : { ...state.filters, _kind: 'accounts' };
-    const sort = kind === 'contacts' ? state.contactSort : state.sort;
+    const filters = kind === 'contacts' ? { ...state.contactFilters, _kind: 'contacts' }
+                  : kind === 'tasks'    ? { ...state.taskFilters,    _kind: 'tasks' }
+                                        : { ...state.filters,        _kind: 'accounts' };
+    const sort = kind === 'contacts' ? state.contactSort
+              : kind === 'tasks'    ? state.taskSort
+                                    : state.sort;
     const { data, error } = await supabase.from('saved_views').insert({
       user_id: state.profile.id, name,
       filters,
@@ -1119,8 +1154,9 @@ function SavedViewsBar({ kind = 'accounts' }) {
     const filters = { ...(v.filters || {}) };
     delete filters._kind;
     const sort = v.sort_by ? { field: v.sort_by, dir: v.sort_dir || 'asc' } : null;
-    if (kind === 'contacts') dispatch({ type: 'APPLY_CONTACT_VIEW', filters, sort });
-    else dispatch({ type: 'APPLY_VIEW', filters, sort });
+    if (kind === 'contacts')    dispatch({ type: 'APPLY_CONTACT_VIEW', filters, sort });
+    else if (kind === 'tasks')  dispatch({ type: 'APPLY_TASK_VIEW',    filters, sort });
+    else                        dispatch({ type: 'APPLY_VIEW',         filters, sort });
   }
 
   return (
@@ -1447,6 +1483,321 @@ function ContactListView() {
           </div>
         ) : (
           <ContactsTable rows={sorted} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
+   TASK LIST VIEW — account-level to-dos with due dates
+   ===================================================================== */
+function applyTaskFilters(tasks, accounts, f, currentUserId) {
+  const acctMap = Object.fromEntries(accounts.map(a => [a.id, a]));
+  const search = (f.search || '').trim().toLowerCase();
+  const now = new Date();
+  const today = new Date(); today.setHours(0,0,0,0);
+  const weekEnd = addDays(today, 7);
+  return tasks.filter(t => {
+    const acct = acctMap[t.account_id];
+    if (!acct || acct.status !== 'active') return false;
+    if (f.assignees.length && !f.assignees.includes(t.assignee_id)) return false;
+
+    if (f.status === 'open' && t.completed_at) return false;
+    if (f.status === 'done' && !t.completed_at) return false;
+    if (f.status === 'mine' && t.assignee_id !== currentUserId) return false;
+    if (f.status === 'overdue') {
+      if (t.completed_at) return false;
+      if (!t.due_at || new Date(t.due_at) >= now) return false;
+    }
+
+    if (f.due === 'today') {
+      if (!t.due_at) return false;
+      const d = new Date(t.due_at);
+      if (d < today || d >= addDays(today, 1)) return false;
+    } else if (f.due === 'week') {
+      if (!t.due_at) return false;
+      const d = new Date(t.due_at);
+      if (d < today || d >= weekEnd) return false;
+    } else if (f.due === 'overdue') {
+      if (!t.due_at || new Date(t.due_at) >= now || t.completed_at) return false;
+    } else if (f.due === 'none') {
+      if (t.due_at) return false;
+    }
+
+    if (search) {
+      const hay = [t.title, t.notes, acct.name].map(x => (x || '').toLowerCase()).join(' ');
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+function applyTaskSort(tasks, accounts, profiles, sort) {
+  const acctMap = Object.fromEntries(accounts.map(a => [a.id, a]));
+  const profileMap = Object.fromEntries(profiles.map(p => [p.id, p]));
+  const k = sort.dir === 'asc' ? 1 : -1;
+  const get = (t) => {
+    switch (sort.field) {
+      case 'title': return (t.title || '').toLowerCase();
+      case 'account': return (acctMap[t.account_id]?.name || '').toLowerCase();
+      case 'assignee': return (profileMap[t.assignee_id]?.full_name || '').toLowerCase();
+      case 'created_at': return t.created_at || '';
+      case 'completed': return t.completed_at ? 1 : 0;
+      case 'due_at':
+      default: return t.due_at || '9999-12-31';
+    }
+  };
+  return tasks.slice().sort((a, b) => {
+    const av = get(a), bv = get(b);
+    if (av < bv) return -1 * k;
+    if (av > bv) return 1 * k;
+    return 0;
+  });
+}
+
+function TaskFilterPanel() {
+  const { state, dispatch } = useApp();
+  const [open, setOpen] = useState(true);
+  const f = state.taskFilters;
+  const set = (patch) => dispatch({ type: 'SET_TASK_FILTERS', filters: patch });
+
+  return (
+    <div className={classNames('border-r border-gray-200 bg-white transition-all', open ? 'w-72' : 'w-10')}>
+      <div className="flex items-center justify-between p-2 border-b border-gray-200">
+        <button onClick={() => setOpen(o => !o)} className="text-sm font-medium text-gray-700">{open ? 'Filters' : '☰'}</button>
+        {open && (
+          <button onClick={() => dispatch({ type: 'RESET_TASK_FILTERS' })} className="text-xs text-blue-600 hover:underline">Reset</button>
+        )}
+      </div>
+      {open && (
+        <div className="p-3 space-y-3 overflow-y-auto scrollbar-thin" style={{ height: 'calc(100vh - 130px)' }}>
+          <Select label="Status" value={f.status} onChange={e => set({ status: e.target.value })}
+                  options={[
+                    {value:'open',label:'Open'},
+                    {value:'mine',label:'Assigned to me'},
+                    {value:'overdue',label:'Overdue (open)'},
+                    {value:'done',label:'Done'},
+                    {value:'any',label:'Any'},
+                  ]} />
+          <Select label="Due" value={f.due} onChange={e => set({ due: e.target.value })}
+                  options={[
+                    {value:'any',label:'Any'},
+                    {value:'today',label:'Today'},
+                    {value:'week',label:'This week'},
+                    {value:'overdue',label:'Overdue'},
+                    {value:'none',label:'No due date'},
+                  ]} />
+          <MultiCheckGroup label="Assignee" options={state.profiles.map(p => ({ value: p.id, label: p.full_name }))} values={f.assignees} onChange={v => set({ assignees: v })} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DueBadge({ due_at, completed_at }) {
+  if (completed_at) return <span className="text-xs text-gray-500 line-through">{due_at ? fmtDate(due_at) : '—'}</span>;
+  if (!due_at) return <span className="text-xs text-gray-400">no due date</span>;
+  const d = new Date(due_at);
+  const today = new Date(); today.setHours(0,0,0,0);
+  const overdue = d < new Date();
+  const isToday = sameDay(d, today);
+  return (
+    <span className={classNames('text-xs',
+      overdue ? 'text-red-600 font-medium' :
+      isToday ? 'text-amber-700 font-medium' :
+      'text-gray-700'
+    )} title={fmtDateTime(due_at)}>
+      {overdue ? 'Overdue · ' : ''}{fmtDate(due_at)}
+      {d.getHours() || d.getMinutes() ? ` · ${fmtTime(d)}` : ''}
+    </span>
+  );
+}
+
+function TasksTable({ rows, scopedAccountId = null }) {
+  const { state, dispatch } = useApp();
+  const acctMap = useMemo(() => Object.fromEntries(state.accounts.map(a => [a.id, a])), [state.accounts]);
+  const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
+  const sel = state.taskSelectedIds;
+  const allSelected = rows.length > 0 && rows.every(r => sel.includes(r.id));
+
+  function sortBy(field) {
+    const next = state.taskSort.field === field
+      ? { field, dir: state.taskSort.dir === 'asc' ? 'desc' : 'asc' }
+      : { field, dir: field === 'due_at' ? 'asc' : 'asc' };
+    dispatch({ type: 'SET_TASK_SORT', sort: next });
+  }
+  function HeaderCell({ k, children }) {
+    const sorted = state.taskSort.field === k;
+    return (
+      <th onClick={() => sortBy(k)}
+          className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap cursor-pointer hover:bg-gray-100">
+        {children}{sorted && <span className="ml-1">{state.taskSort.dir === 'asc' ? '↑' : '↓'}</span>}
+      </th>
+    );
+  }
+
+  async function toggleDone(t) {
+    const patch = { completed_at: t.completed_at ? null : new Date().toISOString() };
+    const { data, error } = await supabase.from('tasks').update(patch).eq('id', t.id).select().single();
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'UPSERT_TASK', task: data });
+  }
+
+  return (
+    <div className="flex-1 overflow-auto scrollbar-thin">
+      <table className="min-w-full border-collapse">
+        <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
+          <tr>
+            <th className="px-3 py-2 w-8">
+              <input type="checkbox" checked={allSelected}
+                onChange={() => allSelected
+                  ? dispatch({ type: 'CLEAR_TASK_SELECTION' })
+                  : dispatch({ type: 'SET_TASK_SELECTION', ids: rows.map(r => r.id) })} />
+            </th>
+            <th className="px-3 py-2 w-8"></th>
+            <HeaderCell k="title">Task</HeaderCell>
+            {!scopedAccountId && <HeaderCell k="account">Account</HeaderCell>}
+            <HeaderCell k="due_at">Due</HeaderCell>
+            <HeaderCell k="assignee">Assignee</HeaderCell>
+            <HeaderCell k="created_at">Created</HeaderCell>
+            <th className="px-3 py-2"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(t => {
+            const a = acctMap[t.account_id];
+            const assignee = profileMap[t.assignee_id];
+            const selected = sel.includes(t.id);
+            return (
+              <tr key={t.id} className={classNames('border-b border-gray-100 row-hover', selected && 'bg-blue-50')}>
+                <td className="px-3 py-2">
+                  <input type="checkbox" checked={selected} onChange={() => dispatch({ type: 'TOGGLE_TASK_SELECT', id: t.id })} />
+                </td>
+                <td className="px-3 py-2">
+                  <input type="checkbox" checked={!!t.completed_at} onChange={() => toggleDone(t)} title={t.completed_at ? 'Mark open' : 'Mark done'} />
+                </td>
+                <td className="px-3 py-2 text-sm">
+                  <button onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'edit_task', props: { task: t } })}
+                    className={classNames('text-left hover:underline', t.completed_at ? 'text-gray-500 line-through' : 'text-gray-900 font-medium')}>
+                    {t.title}
+                  </button>
+                  {t.notes && <div className="text-xs text-gray-500 mt-0.5 truncate-cell">{t.notes}</div>}
+                </td>
+                {!scopedAccountId && (
+                  <td className="px-3 py-2 text-sm">
+                    {a && (
+                      <button onClick={() => window.location.hash = `#/accounts/${a.id}`} className="text-blue-700 hover:underline truncate-cell text-left">
+                        {a.name}
+                      </button>
+                    )}
+                  </td>
+                )}
+                <td className="px-3 py-2"><DueBadge due_at={t.due_at} completed_at={t.completed_at} /></td>
+                <td className="px-3 py-2 text-sm">
+                  {assignee ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-blue-600 text-white text-[10px] font-semibold flex items-center justify-center">
+                        {(assignee.full_name || '?').slice(0,2).toUpperCase()}
+                      </span>
+                      <span className="text-xs text-gray-700">{assignee.full_name}</span>
+                    </span>
+                  ) : <span className="text-xs text-gray-400">—</span>}
+                </td>
+                <td className="px-3 py-2 text-xs text-gray-600 whitespace-nowrap" title={fmtDateTime(t.created_at)}>{relativeTime(t.created_at)}</td>
+                <td className="px-3 py-2 text-right">
+                  <button onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'edit_task', props: { task: t } })}
+                          className="text-xs text-blue-600 hover:underline">Edit</button>
+                </td>
+              </tr>
+            );
+          })}
+          {rows.length === 0 && (
+            <tr>
+              <td colSpan={8} className="text-center py-16 text-sm text-gray-500">
+                <div className="font-medium text-gray-700 mb-1">No tasks match the current filters.</div>
+                <div className="text-xs">Adjust filters or add a task from any account.</div>
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TaskBulkActionBar() {
+  const { state, dispatch } = useApp();
+  const sel = state.taskSelectedIds;
+  if (sel.length === 0) return null;
+
+  async function markDone() {
+    const { error } = await supabase.from('tasks').update({ completed_at: new Date().toISOString() }).in('id', sel);
+    if (error) return notify(dispatch, error.message, 'error');
+    sel.forEach(id => dispatch({ type: 'UPSERT_TASK', task: { id, completed_at: new Date().toISOString() } }));
+    dispatch({ type: 'CLEAR_TASK_SELECTION' });
+    notify(dispatch, `${sel.length} task(s) marked done.`);
+  }
+  async function deleteSel() {
+    if (!window.confirm(`Delete ${sel.length} task(s)?`)) return;
+    const { error } = await supabase.from('tasks').delete().in('id', sel);
+    if (error) return notify(dispatch, error.message, 'error');
+    sel.forEach(id => dispatch({ type: 'REMOVE_TASK', id }));
+    dispatch({ type: 'CLEAR_TASK_SELECTION' });
+    notify(dispatch, 'Deleted.');
+  }
+
+  return (
+    <div className="sticky top-0 z-10 bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center gap-3">
+      <div className="text-sm text-blue-900 font-medium">{sel.length} selected</div>
+      <Button variant="secondary" size="sm" onClick={markDone}>Mark done</Button>
+      <Button variant="secondary" size="sm" onClick={deleteSel}>Delete</Button>
+      <button onClick={() => dispatch({ type: 'CLEAR_TASK_SELECTION' })} className="ml-auto text-xs text-blue-700 hover:underline">Clear</button>
+    </div>
+  );
+}
+
+function TaskListView() {
+  const { state, dispatch } = useApp();
+  const filtered = useMemo(
+    () => applyTaskFilters(state.allTasks, state.accounts, state.taskFilters, state.profile?.id),
+    [state.allTasks, state.accounts, state.taskFilters, state.profile?.id]
+  );
+  const sorted = useMemo(
+    () => applyTaskSort(filtered, state.accounts, state.profiles, state.taskSort),
+    [filtered, state.accounts, state.profiles, state.taskSort]
+  );
+
+  return (
+    <div className="flex flex-1 overflow-hidden">
+      <TaskFilterPanel />
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <ListTabSwitcher />
+        <SavedViewsBar kind="tasks" />
+        <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
+          <span className="text-sm text-gray-600">{sorted.length} task{sorted.length === 1 ? '' : 's'}</span>
+          <div className="ml-auto flex items-center gap-2">
+            <div className="w-72">
+              <Input
+                placeholder="Search title, notes, account…"
+                value={state.taskFilters.search}
+                onChange={e => dispatch({ type: 'SET_TASK_FILTERS', filters: { search: e.target.value } })}
+              />
+            </div>
+            <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_task' })}>+ New task</Button>
+          </div>
+        </div>
+        <TaskBulkActionBar />
+        {state.allTasks.length === 0 && !state.loading ? (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="text-center max-w-sm">
+              <div className="text-base font-medium text-gray-800 mb-1">No tasks yet</div>
+              <div className="text-sm text-gray-500 mb-4">Tasks are tied to accounts. Add one from any account's Tasks tab, or click below.</div>
+              <Button onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_task' })}>+ Add a task</Button>
+            </div>
+          </div>
+        ) : (
+          <TasksTable rows={sorted} />
         )}
       </div>
     </div>
@@ -1817,6 +2168,7 @@ function AccountDetailView({ accountId }) {
           </div>
           <div className="flex items-center gap-2">
             <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_meeting', props: { accountId } })}>📅 Schedule meeting</Button>
+            <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_task', props: { accountId } })}>+ Task</Button>
             <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId } })}>Log activity</Button>
             {canEdit && (
               <>
@@ -1828,11 +2180,15 @@ function AccountDetailView({ accountId }) {
         </div>
 
         <div className="border-b border-gray-200 flex gap-4 sticky top-0 bg-gray-50 z-10">
-          {['overview','contacts','activity','notes'].map(t => (
+          {['overview','contacts','tasks','activity','notes'].map(t => (
             <button key={t} onClick={() => setTab(t)}
               className={classNames('px-1 py-2 text-sm font-medium border-b-2',
                 tab === t ? 'border-blue-600 text-blue-700' : 'border-transparent text-gray-600 hover:text-gray-900')}>
-              {t === 'overview' ? 'Overview' : t === 'contacts' ? `Contacts${contacts.length ? ` (${contacts.length})` : ''}` : t === 'activity' ? `Activity${activities.length ? ` (${activities.length})` : ''}` : 'Notes'}
+              {t === 'overview' ? 'Overview'
+                : t === 'contacts' ? `Contacts${contacts.length ? ` (${contacts.length})` : ''}`
+                : t === 'tasks' ? `Tasks${state.allTasks.filter(x => x.account_id === account.id && !x.completed_at).length ? ` (${state.allTasks.filter(x => x.account_id === account.id && !x.completed_at).length})` : ''}`
+                : t === 'activity' ? `Activity${activities.length ? ` (${activities.length})` : ''}`
+                : 'Notes'}
             </button>
           ))}
         </div>
@@ -1840,6 +2196,7 @@ function AccountDetailView({ accountId }) {
         <div className="py-4">
           {tab === 'overview' && <OverviewTab account={account} canEdit={canEdit} />}
           {tab === 'contacts' && <ContactsTab account={account} contacts={contacts} canEdit={canEdit} />}
+          {tab === 'tasks' && <TasksTab account={account} />}
           {tab === 'activity' && <ActivityTab account={account} activities={activities} contacts={contacts} />}
           {tab === 'notes' && <NotesTab account={account} canEdit={canEdit} />}
         </div>
@@ -2135,6 +2492,71 @@ function ActivityTab({ account, activities, contacts }) {
                     {user?.full_name || 'Unknown'} · <span title={fmtDateTime(a.occurred_at)}>{relativeTime(a.occurred_at)}</span>
                   </div>
                 </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =====================================================================
+   TASKS TAB (on account detail) — scoped to one account
+   ===================================================================== */
+function TasksTab({ account }) {
+  const { state, dispatch } = useApp();
+  const [showDone, setShowDone] = useState(false);
+  const tasks = state.allTasks.filter(t => t.account_id === account.id);
+  const visible = (showDone ? tasks : tasks.filter(t => !t.completed_at))
+    .slice().sort((a,b) => (a.due_at || '9999') < (b.due_at || '9999') ? -1 : 1);
+
+  async function toggleDone(t) {
+    const patch = { completed_at: t.completed_at ? null : new Date().toISOString() };
+    const { data, error } = await supabase.from('tasks').update(patch).eq('id', t.id).select().single();
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'UPSERT_TASK', task: data });
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-3">
+          <div className="text-sm text-gray-600">
+            {tasks.filter(t => !t.completed_at).length} open · {tasks.filter(t => t.completed_at).length} done
+          </div>
+          <label className="text-xs text-gray-600 flex items-center gap-1.5">
+            <input type="checkbox" checked={showDone} onChange={e => setShowDone(e.target.checked)} />
+            Show completed
+          </label>
+        </div>
+        <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_task', props: { accountId: account.id } })}>+ Add task</Button>
+      </div>
+      {visible.length === 0 ? (
+        <div className="bg-white border border-gray-200 rounded p-8 text-center">
+          <div className="text-sm text-gray-600 mb-3">No tasks yet for this account.</div>
+          <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_task', props: { accountId: account.id } })}>Add the first task</Button>
+        </div>
+      ) : (
+        <div className="bg-white border border-gray-200 rounded divide-y divide-gray-100">
+          {visible.map(t => {
+            const assignee = state.profiles.find(p => p.id === t.assignee_id);
+            return (
+              <div key={t.id} className="px-4 py-3 flex items-start gap-3">
+                <input type="checkbox" checked={!!t.completed_at} onChange={() => toggleDone(t)} className="mt-1" />
+                <div className="flex-1 min-w-0">
+                  <button onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'edit_task', props: { task: t } })}
+                    className={classNames('text-sm text-left hover:underline',
+                      t.completed_at ? 'text-gray-500 line-through' : 'text-gray-900 font-medium')}>
+                    {t.title}
+                  </button>
+                  {t.notes && <div className="text-xs text-gray-600 mt-0.5 whitespace-pre-wrap">{t.notes}</div>}
+                  <div className="mt-1 flex items-center gap-3 flex-wrap">
+                    <DueBadge due_at={t.due_at} completed_at={t.completed_at} />
+                    {assignee && <span className="text-xs text-gray-600">· {assignee.full_name}</span>}
+                  </div>
+                </div>
+                <button onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'edit_task', props: { task: t } })} className="text-xs text-blue-600 hover:underline">Edit</button>
               </div>
             );
           })}
@@ -2449,6 +2871,87 @@ function autoMap(header) {
 /* =====================================================================
    CREATE MEETING MODAL — push to Google Calendar + optional account link
    ===================================================================== */
+/* =====================================================================
+   TASK MODAL — create or edit a task
+   ===================================================================== */
+function TaskModal() {
+  const { state, dispatch } = useApp();
+  const { task, accountId: initialAccountId } = state.modalProps;
+  const editing = !!task;
+
+  const [accountId, setAccountId] = useState(task?.account_id || initialAccountId || '');
+  const [title, setTitle] = useState(task?.title || '');
+  const [notes, setNotes] = useState(task?.notes || '');
+  const [assigneeId, setAssigneeId] = useState(task?.assignee_id || state.profile?.id || '');
+  const [dueDate, setDueDate] = useState(task?.due_at ? task.due_at.slice(0,10) : '');
+  const [dueTime, setDueTime] = useState(task?.due_at ? new Date(task.due_at).toTimeString().slice(0,5) : '');
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!title.trim()) return notify(dispatch, 'Title required.', 'error');
+    if (!accountId) return notify(dispatch, 'Account required.', 'error');
+    if (!assigneeId) return notify(dispatch, 'Assignee required.', 'error');
+
+    setBusy(true);
+    const due_at = dueDate ? new Date(`${dueDate}T${dueTime || '17:00'}`).toISOString() : null;
+    const payload = {
+      account_id: accountId,
+      assignee_id: assigneeId,
+      title: title.trim(),
+      notes: notes || null,
+      due_at,
+    };
+    let result;
+    if (editing) {
+      result = await supabase.from('tasks').update(payload).eq('id', task.id).select().single();
+    } else {
+      result = await supabase.from('tasks').insert({ ...payload, created_by: state.profile.id }).select().single();
+    }
+    setBusy(false);
+    if (result.error) return notify(dispatch, result.error.message, 'error');
+    dispatch({ type: 'UPSERT_TASK', task: result.data });
+    dispatch({ type: 'CLOSE_MODAL' });
+    notify(dispatch, editing ? 'Task updated.' : 'Task added.');
+  }
+
+  async function deleteTask() {
+    if (!editing) return;
+    if (!window.confirm('Delete this task?')) return;
+    const { error } = await supabase.from('tasks').delete().eq('id', task.id);
+    if (error) return notify(dispatch, error.message, 'error');
+    dispatch({ type: 'REMOVE_TASK', id: task.id });
+    dispatch({ type: 'CLOSE_MODAL' });
+    notify(dispatch, 'Deleted.');
+  }
+
+  return (
+    <Modal open={true} onClose={() => dispatch({ type: 'CLOSE_MODAL' })} title={editing ? 'Edit task' : 'New task'} width="max-w-xl">
+      <form onSubmit={submit} className="space-y-3">
+        <Input label="Title *" value={title} onChange={e => setTitle(e.target.value)} required autoFocus placeholder="Follow up on proposal, send pricing, etc." />
+        <Select label="Account *" value={accountId} onChange={e => setAccountId(e.target.value)} includeBlank
+                options={state.accounts.filter(a => a.status === 'active').map(a => ({ value: a.id, label: a.name }))} />
+        <div className="grid grid-cols-2 gap-3">
+          <Input label="Due date" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
+          <Input label="Due time" type="time" value={dueTime} onChange={e => setDueTime(e.target.value)} />
+        </div>
+        <Select label="Assignee *" value={assigneeId} onChange={e => setAssigneeId(e.target.value)}
+                options={state.profiles.map(p => ({ value: p.id, label: p.full_name }))} />
+        <Textarea label="Notes" rows={3} value={notes} onChange={e => setNotes(e.target.value)} />
+        <div className="flex items-center justify-between pt-2 border-t border-gray-200">
+          {editing
+            ? <Button type="button" variant="ghost" onClick={deleteTask} className="text-red-600">Delete</Button>
+            : <span />}
+          <div className="flex gap-2">
+            <Button type="button" variant="secondary" onClick={() => dispatch({ type: 'CLOSE_MODAL' })}>Cancel</Button>
+            <Button type="submit" disabled={busy}>{busy ? 'Saving…' : (editing ? 'Save' : 'Add task')}</Button>
+          </div>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 function MeetingModal() {
   const { state, dispatch } = useApp();
   const { startISO, accountId: initialAccountId } = state.modalProps;
@@ -2937,14 +3440,16 @@ function App() {
     if (!state.user) return;
     (async () => {
       dispatch({ type: 'SET_LOADING', loading: true });
-      const [{ data: profs }, { data: accs }, { data: ctcs }] = await Promise.all([
+      const [{ data: profs }, { data: accs }, { data: ctcs }, { data: tsks }] = await Promise.all([
         supabase.from('profiles').select('*').order('full_name', { ascending: true }),
         supabase.from('accounts').select('*').neq('status', 'deleted').order('updated_at', { ascending: false }),
         supabase.from('contacts').select('*').order('created_at', { ascending: false }),
+        supabase.from('tasks').select('*').order('due_at', { ascending: true, nullsFirst: false }),
       ]);
       if (profs) dispatch({ type: 'SET_PROFILES', profiles: profs });
       if (accs) dispatch({ type: 'LOAD_ACCOUNTS', accounts: accs });
       if (ctcs) dispatch({ type: 'SET_ALL_CONTACTS', contacts: ctcs });
+      if (tsks) dispatch({ type: 'SET_ALL_TASKS', tasks: tsks });
       dispatch({ type: 'SET_LOADING', loading: false });
     })();
   }, [state.user?.id]);
@@ -2994,13 +3499,17 @@ function App() {
             ? <AccountDetailView accountId={state.route.accountId} />
             : state.route.tab === 'contacts'
               ? <ContactListView />
-              : <AccountListView />}
+              : state.route.tab === 'tasks'
+                ? <TaskListView />
+                : <AccountListView />}
       </div>
       {state.modal === 'add_account' && <AddAccountModal />}
       {state.modal === 'add_contact' && <ContactModal />}
       {state.modal === 'log_activity' && <LogActivityModal />}
       {state.modal === 'import' && <ImportModal />}
       {state.modal === 'create_meeting' && <MeetingModal />}
+      {state.modal === 'create_task' && <TaskModal />}
+      {state.modal === 'edit_task' && <TaskModal />}
       <Toast />
     </AppCtx.Provider>
   );
