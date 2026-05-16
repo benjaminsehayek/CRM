@@ -67,24 +67,10 @@ create type industry as enum (
 );
 
 create type marketing_channel as enum (
-  'google_ads',
-  'meta_ads',
-  'seo_agency',
-  'yelp',
-  'angi',
-  'homeadvisor',
-  'thumbtack',
-  'nextdoor_ads',
-  'bni',
-  'chamber',
-  'direct_mail',
-  'radio',
-  'tv',
-  'billboard',
-  'truck_signage',
-  'referrals_only',
-  'none',
-  'unknown'
+  'google',
+  'social_media',
+  'display',
+  'offline'
 );
 
 create type revenue_range as enum (
