@@ -360,15 +360,26 @@ const initialState = {
   savedViews: [],
   route: parseHash(window.location.hash),
   googleConnected: false,
+
+  // Contacts tab — master list across all accounts
+  allContacts: [],
+  contactFilters: {
+    owners: [], stages: [], states: [], industries: [],
+    titleContains: '', hasEmail: 'any', hasPhone: 'any', isPrimary: 'any',
+    search: '',
+  },
+  contactSort: { field: 'last_name', dir: 'asc' },
+  contactSelectedIds: [],
 };
 
 function parseHash(hash) {
   const h = (hash || '').replace(/^#\/?/, '');
-  if (!h || h === 'accounts') return { name: 'list' };
+  if (!h || h === 'accounts') return { name: 'list', tab: 'accounts' };
+  if (h === 'contacts') return { name: 'list', tab: 'contacts' };
   if (h === 'calendar') return { name: 'calendar' };
   const m = h.match(/^accounts\/([0-9a-fA-F-]{36})$/);
   if (m) return { name: 'detail', accountId: m[1] };
-  return { name: 'list' };
+  return { name: 'list', tab: 'accounts' };
 }
 
 function appReducer(state, action) {
@@ -420,6 +431,25 @@ function appReducer(state, action) {
     case 'SET_SAVED_VIEWS':  return { ...state, savedViews: action.views };
     case 'SET_ROUTE':        return { ...state, route: action.route };
     case 'SET_GOOGLE':       return { ...state, googleConnected: !!action.connected };
+    case 'SET_ALL_CONTACTS': return { ...state, allContacts: action.contacts };
+    case 'UPSERT_ALL_CONTACT': {
+      const i = state.allContacts.findIndex(c => c.id === action.contact.id);
+      const next = state.allContacts.slice();
+      if (i >= 0) next[i] = action.contact;
+      else next.unshift(action.contact);
+      return { ...state, allContacts: next };
+    }
+    case 'REMOVE_ALL_CONTACT': return { ...state, allContacts: state.allContacts.filter(c => c.id !== action.id) };
+    case 'SET_CONTACT_FILTERS':   return { ...state, contactFilters: { ...state.contactFilters, ...action.filters } };
+    case 'RESET_CONTACT_FILTERS': return { ...state, contactFilters: initialState.contactFilters };
+    case 'SET_CONTACT_SORT':      return { ...state, contactSort: action.sort };
+    case 'TOGGLE_CONTACT_SELECT': {
+      const has = state.contactSelectedIds.includes(action.id);
+      return { ...state, contactSelectedIds: has ? state.contactSelectedIds.filter(x => x !== action.id) : [...state.contactSelectedIds, action.id] };
+    }
+    case 'SET_CONTACT_SELECTION':   return { ...state, contactSelectedIds: action.ids };
+    case 'CLEAR_CONTACT_SELECTION': return { ...state, contactSelectedIds: [] };
+    case 'APPLY_CONTACT_VIEW':      return { ...state, contactFilters: { ...initialState.contactFilters, ...action.filters }, contactSort: action.sort || state.contactSort };
     case 'APPLY_VIEW':       return { ...state, filters: { ...initialState.filters, ...action.filters }, sort: action.sort || state.sort };
     default: return state;
   }
@@ -1022,7 +1052,23 @@ function BulkActionBar({ rows }) {
 /* =====================================================================
    SAVED VIEWS
    ===================================================================== */
-function SavedViewsBar() {
+function ListTabSwitcher() {
+  const tab = parseHash(window.location.hash).tab || 'accounts';
+  return (
+    <div className="bg-white border-b border-gray-200 px-4 py-1.5 flex items-center gap-2">
+      {[{ key: 'accounts', label: 'Accounts' }, { key: 'contacts', label: 'Contacts' }].map(t => (
+        <button key={t.key}
+          onClick={() => { window.location.hash = `#/${t.key}`; }}
+          className={classNames('px-3 py-1 text-sm font-medium rounded',
+            tab === t.key ? 'bg-gray-900 text-white' : 'text-gray-700 hover:bg-gray-100')}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SavedViewsBar({ kind = 'accounts' }) {
   const { state, dispatch } = useApp();
 
   async function refresh() {
@@ -1031,14 +1077,20 @@ function SavedViewsBar() {
   }
   useEffect(() => { if (state.profile) refresh(); }, [state.profile?.id]);
 
+  const visible = state.savedViews.filter(v => (v.filters?._kind || 'accounts') === kind);
+
   async function saveCurrent() {
     const name = window.prompt('Name this view:');
     if (!name) return;
+    const filters = kind === 'contacts'
+      ? { ...state.contactFilters, _kind: 'contacts' }
+      : { ...state.filters, _kind: 'accounts' };
+    const sort = kind === 'contacts' ? state.contactSort : state.sort;
     const { data, error } = await supabase.from('saved_views').insert({
       user_id: state.profile.id, name,
-      filters: state.filters,
-      sort_by: state.sort.field,
-      sort_dir: state.sort.dir,
+      filters,
+      sort_by: sort.field,
+      sort_dir: sort.dir,
     }).select().single();
     if (error) return notify(dispatch, error.message, 'error');
     dispatch({ type: 'SET_SAVED_VIEWS', views: [data, ...state.savedViews] });
@@ -1051,14 +1103,18 @@ function SavedViewsBar() {
     dispatch({ type: 'SET_SAVED_VIEWS', views: state.savedViews.filter(v => v.id !== id) });
   }
   function loadView(v) {
-    dispatch({ type: 'APPLY_VIEW', filters: v.filters || {}, sort: v.sort_by ? { field: v.sort_by, dir: v.sort_dir || 'asc' } : null });
+    const filters = { ...(v.filters || {}) };
+    delete filters._kind;
+    const sort = v.sort_by ? { field: v.sort_by, dir: v.sort_dir || 'asc' } : null;
+    if (kind === 'contacts') dispatch({ type: 'APPLY_CONTACT_VIEW', filters, sort });
+    else dispatch({ type: 'APPLY_VIEW', filters, sort });
   }
 
   return (
     <div className="bg-white border-b border-gray-200 px-4 py-1.5 flex items-center gap-2 overflow-x-auto">
       <span className="text-xs text-gray-500 font-medium mr-1">Saved views:</span>
-      {state.savedViews.length === 0 && <span className="text-xs text-gray-400 italic">none yet</span>}
-      {state.savedViews.map(v => (
+      {visible.length === 0 && <span className="text-xs text-gray-400 italic">none yet</span>}
+      {visible.map(v => (
         <span key={v.id} className="inline-flex items-center gap-1 bg-gray-100 rounded text-xs px-2 py-1">
           <button onClick={() => loadView(v)} className="font-medium text-gray-800 hover:text-blue-700">{v.name}</button>
           <button onClick={() => deleteView(v.id)} className="text-gray-400 hover:text-red-600 ml-1" title="Delete">×</button>
@@ -1082,7 +1138,8 @@ function AccountListView() {
     <div className="flex flex-1 overflow-hidden">
       <FilterPanel />
       <div className="flex-1 flex flex-col overflow-hidden">
-        <SavedViewsBar />
+        <ListTabSwitcher />
+        <SavedViewsBar kind="accounts" />
         <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
           <span className="text-sm text-gray-600">{sorted.length} account{sorted.length === 1 ? '' : 's'}</span>
           <div className="ml-auto flex items-center gap-2">
@@ -1103,6 +1160,280 @@ function AccountListView() {
           </div>
         ) : (
           <AccountsTable rows={sorted} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
+   CONTACT LIST VIEW — master list of every contact across all accounts
+   ===================================================================== */
+function applyContactFilters(contacts, accounts, f) {
+  const acctMap = Object.fromEntries(accounts.map(a => [a.id, a]));
+  const search = (f.search || '').trim().toLowerCase();
+  return contacts.filter(c => {
+    const acct = acctMap[c.account_id];
+    if (!acct || acct.status !== 'active') return false;
+    if (f.owners.length && !f.owners.includes(acct.owner_id)) return false;
+    if (f.stages.length && !f.stages.includes(acct.deal_stage)) return false;
+    if (f.states.length && !f.states.includes(acct.state)) return false;
+    if (f.industries.length && !f.industries.includes(acct.industry)) return false;
+    if (f.titleContains && !(c.title || '').toLowerCase().includes(f.titleContains.toLowerCase())) return false;
+    if (f.hasEmail === 'yes' && !c.email) return false;
+    if (f.hasEmail === 'no' && c.email) return false;
+    if (f.hasPhone === 'yes' && !c.phone && !c.mobile) return false;
+    if (f.hasPhone === 'no' && (c.phone || c.mobile)) return false;
+    if (f.isPrimary === 'yes' && !c.is_primary) return false;
+    if (f.isPrimary === 'no' && c.is_primary) return false;
+    if (search) {
+      const hay = [c.first_name, c.last_name, c.email, c.phone, c.mobile, c.title, acct.name].map(x => (x || '').toLowerCase()).join(' ');
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+function applyContactSort(contacts, accounts, profiles, sort) {
+  const acctMap = Object.fromEntries(accounts.map(a => [a.id, a]));
+  const profileMap = Object.fromEntries(profiles.map(p => [p.id, p]));
+  const k = sort.dir === 'asc' ? 1 : -1;
+  const get = (c) => {
+    const a = acctMap[c.account_id] || {};
+    switch (sort.field) {
+      case 'first_name': return (c.first_name || '').toLowerCase();
+      case 'last_name': return (c.last_name || '').toLowerCase();
+      case 'title': return (c.title || '').toLowerCase();
+      case 'account': return (a.name || '').toLowerCase();
+      case 'email': return (c.email || '').toLowerCase();
+      case 'owner': return (profileMap[a.owner_id]?.full_name || '').toLowerCase();
+      case 'last_contact': return a.last_contact_date || '';
+      case 'location': return ((a.state || '') + (a.city || '')).toLowerCase();
+      case 'is_primary': return c.is_primary ? 1 : 0;
+      default: return c.created_at || '';
+    }
+  };
+  return contacts.slice().sort((a,b) => {
+    const av = get(a), bv = get(b);
+    if (av < bv) return -1 * k;
+    if (av > bv) return 1 * k;
+    return 0;
+  });
+}
+
+function ContactFilterPanel() {
+  const { state, dispatch } = useApp();
+  const [open, setOpen] = useState(true);
+  const f = state.contactFilters;
+  const set = (patch) => dispatch({ type: 'SET_CONTACT_FILTERS', filters: patch });
+
+  return (
+    <div className={classNames('border-r border-gray-200 bg-white transition-all', open ? 'w-72' : 'w-10')}>
+      <div className="flex items-center justify-between p-2 border-b border-gray-200">
+        <button onClick={() => setOpen(o => !o)} className="text-sm font-medium text-gray-700">{open ? 'Filters' : '☰'}</button>
+        {open && (
+          <button onClick={() => dispatch({ type: 'RESET_CONTACT_FILTERS' })} className="text-xs text-blue-600 hover:underline">Reset</button>
+        )}
+      </div>
+      {open && (
+        <div className="p-3 space-y-3 overflow-y-auto scrollbar-thin" style={{ height: 'calc(100vh - 130px)' }}>
+          <MultiCheckGroup label="Owner (of account)" options={state.profiles.map(p => ({ value: p.id, label: p.full_name }))} values={f.owners} onChange={v => set({ owners: v })} />
+          <MultiCheckGroup label="Deal stage (of account)" options={DEAL_STAGES} values={f.stages} onChange={v => set({ stages: v })} />
+          <MultiCheckGroup label="State (of account)" options={US_STATES.map(s => ({ value: s, label: s }))} values={f.states} onChange={v => set({ states: v })} />
+          <MultiCheckGroup label="Industry (of account)" options={INDUSTRIES} values={f.industries} onChange={v => set({ industries: v })} />
+          <Input label="Title contains" value={f.titleContains} onChange={e => set({ titleContains: e.target.value })} />
+          <Select label="Has email" value={f.hasEmail} onChange={e => set({ hasEmail: e.target.value })}
+                  options={[{value:'any',label:'Any'},{value:'yes',label:'Yes'},{value:'no',label:'No'}]} />
+          <Select label="Has phone" value={f.hasPhone} onChange={e => set({ hasPhone: e.target.value })}
+                  options={[{value:'any',label:'Any'},{value:'yes',label:'Yes'},{value:'no',label:'No'}]} />
+          <Select label="Primary contact" value={f.isPrimary} onChange={e => set({ isPrimary: e.target.value })}
+                  options={[{value:'any',label:'Any'},{value:'yes',label:'Yes'},{value:'no',label:'No'}]} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ContactsTable({ rows }) {
+  const { state, dispatch } = useApp();
+  const acctMap = useMemo(() => Object.fromEntries(state.accounts.map(a => [a.id, a])), [state.accounts]);
+  const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
+  const sel = state.contactSelectedIds;
+  const allSelected = rows.length > 0 && rows.every(r => sel.includes(r.id));
+
+  function sortBy(field) {
+    const next = state.contactSort.field === field
+      ? { field, dir: state.contactSort.dir === 'asc' ? 'desc' : 'asc' }
+      : { field, dir: 'asc' };
+    dispatch({ type: 'SET_CONTACT_SORT', sort: next });
+  }
+  function HeaderCell({ k, children }) {
+    const sorted = state.contactSort.field === k;
+    return (
+      <th onClick={() => sortBy(k)}
+          className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap cursor-pointer hover:bg-gray-100">
+        {children}{sorted && <span className="ml-1">{state.contactSort.dir === 'asc' ? '↑' : '↓'}</span>}
+      </th>
+    );
+  }
+
+  return (
+    <div className="flex-1 overflow-auto scrollbar-thin">
+      <table className="min-w-full border-collapse">
+        <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
+          <tr>
+            <th className="px-3 py-2 w-8">
+              <input type="checkbox" checked={allSelected}
+                onChange={() => allSelected
+                  ? dispatch({ type: 'CLEAR_CONTACT_SELECTION' })
+                  : dispatch({ type: 'SET_CONTACT_SELECTION', ids: rows.map(r => r.id) })} />
+            </th>
+            <HeaderCell k="last_name">Name</HeaderCell>
+            <HeaderCell k="title">Title</HeaderCell>
+            <HeaderCell k="account">Account</HeaderCell>
+            <HeaderCell k="email">Email</HeaderCell>
+            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs">Phone</th>
+            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs">Mobile</th>
+            <HeaderCell k="is_primary">Primary</HeaderCell>
+            <HeaderCell k="owner">Owner</HeaderCell>
+            <HeaderCell k="last_contact">Last contact</HeaderCell>
+            <HeaderCell k="location">City, State</HeaderCell>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(c => {
+            const a = acctMap[c.account_id];
+            const owner = a && profileMap[a.owner_id];
+            const selected = sel.includes(c.id);
+            return (
+              <tr key={c.id} className={classNames('border-b border-gray-100 row-hover', selected && 'bg-blue-50')}>
+                <td className="px-3 py-2">
+                  <input type="checkbox" checked={selected} onChange={() => dispatch({ type: 'TOGGLE_CONTACT_SELECT', id: c.id })} />
+                </td>
+                <td className="px-3 py-2 text-sm">
+                  <button className="text-blue-700 hover:underline font-medium text-left"
+                    onClick={() => a && (window.location.hash = `#/accounts/${a.id}`)}>
+                    {[c.first_name, c.last_name].filter(Boolean).join(' ') || '(no name)'}
+                  </button>
+                </td>
+                <td className="px-3 py-2 text-sm text-gray-800 truncate-cell">{c.title}</td>
+                <td className="px-3 py-2 text-sm">
+                  {a && (
+                    <button className="text-blue-700 hover:underline text-left truncate-cell"
+                      onClick={() => window.location.hash = `#/accounts/${a.id}`}>{a.name}</button>
+                  )}
+                </td>
+                <td className="px-3 py-2 text-sm text-gray-800">
+                  {c.email && <a href={`mailto:${c.email}`} className="hover:underline">{c.email}</a>}
+                </td>
+                <td className="px-3 py-2 text-sm text-gray-800">{c.phone && formatPhone(c.phone)}</td>
+                <td className="px-3 py-2 text-sm text-gray-800">{c.mobile && formatPhone(c.mobile)}</td>
+                <td className="px-3 py-2 text-sm">
+                  {c.is_primary ? <Pill className="bg-blue-100 text-blue-800">Primary</Pill> : <span className="text-gray-400">—</span>}
+                </td>
+                <td className="px-3 py-2 text-sm">
+                  {owner ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-blue-600 text-white text-[10px] font-semibold flex items-center justify-center">
+                        {(owner.full_name || '?').slice(0,2).toUpperCase()}
+                      </span>
+                      <span className="text-xs text-gray-700">{owner.full_name}</span>
+                    </span>
+                  ) : <span className="text-xs text-gray-400">—</span>}
+                </td>
+                <td className="px-3 py-2 text-sm text-gray-700 whitespace-nowrap">
+                  {a?.last_contact_date ? relativeTime(a.last_contact_date) : '—'}
+                </td>
+                <td className="px-3 py-2 text-sm text-gray-700 whitespace-nowrap">
+                  {a ? [a.city, a.state].filter(Boolean).join(', ') : ''}
+                </td>
+              </tr>
+            );
+          })}
+          {rows.length === 0 && (
+            <tr>
+              <td colSpan={11} className="text-center py-16 text-sm text-gray-500">
+                <div className="font-medium text-gray-700 mb-1">No contacts match the current filters.</div>
+                <div className="text-xs">Adjust filters, or add contacts from any account's detail page.</div>
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ContactBulkActionBar({ rows }) {
+  const { state, dispatch } = useApp();
+  const sel = state.contactSelectedIds;
+  if (sel.length === 0) return null;
+
+  function exportSel() {
+    const acctMap = Object.fromEntries(state.accounts.map(a => [a.id, a]));
+    const subset = rows.filter(r => sel.includes(r.id)).map(c => {
+      const a = acctMap[c.account_id] || {};
+      return {
+        first_name: c.first_name, last_name: c.last_name, title: c.title,
+        email: c.email, phone: c.phone, mobile: c.mobile, is_primary: c.is_primary,
+        account_name: a.name, account_website: a.website,
+        account_city: a.city, account_state: a.state, account_phone: a.phone,
+      };
+    });
+    const csv = Papa.unparse(subset);
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `contacts-${todayISO()}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="sticky top-0 z-10 bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center gap-3">
+      <div className="text-sm text-blue-900 font-medium">{sel.length} selected</div>
+      <Button variant="secondary" size="sm" onClick={exportSel}>Export CSV</Button>
+      <button onClick={() => dispatch({ type: 'CLEAR_CONTACT_SELECTION' })} className="ml-auto text-xs text-blue-700 hover:underline">Clear selection</button>
+    </div>
+  );
+}
+
+function ContactListView() {
+  const { state, dispatch } = useApp();
+  const filtered = useMemo(
+    () => applyContactFilters(state.allContacts, state.accounts, state.contactFilters),
+    [state.allContacts, state.accounts, state.contactFilters]
+  );
+  const sorted = useMemo(
+    () => applyContactSort(filtered, state.accounts, state.profiles, state.contactSort),
+    [filtered, state.accounts, state.profiles, state.contactSort]
+  );
+
+  return (
+    <div className="flex flex-1 overflow-hidden">
+      <ContactFilterPanel />
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <ListTabSwitcher />
+        <SavedViewsBar kind="contacts" />
+        <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
+          <span className="text-sm text-gray-600">{sorted.length} contact{sorted.length === 1 ? '' : 's'}</span>
+          <div className="ml-auto w-72">
+            <Input
+              placeholder="Search name, email, phone, account…"
+              value={state.contactFilters.search}
+              onChange={e => dispatch({ type: 'SET_CONTACT_FILTERS', filters: { search: e.target.value } })}
+            />
+          </div>
+        </div>
+        <ContactBulkActionBar rows={sorted} />
+        {state.allContacts.length === 0 && !state.loading ? (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="text-center max-w-sm">
+              <div className="text-base font-medium text-gray-800 mb-1">No contacts yet</div>
+              <div className="text-sm text-gray-500">Open any account and add a contact from the Contacts tab.</div>
+            </div>
+          </div>
+        ) : (
+          <ContactsTable rows={sorted} />
         )}
       </div>
     </div>
@@ -1693,13 +2024,17 @@ function ContactsTab({ account, contacts, canEdit }) {
     if (error) return notify(dispatch, error.message, 'error');
     // Refresh whole list because trigger may have flipped others
     const { data: list } = await supabase.from('contacts').select('*').eq('account_id', account.id).order('is_primary', { ascending: false });
-    if (list) dispatch({ type: 'LOAD_CONTACTS', accountId: account.id, contacts: list });
+    if (list) {
+      dispatch({ type: 'LOAD_CONTACTS', accountId: account.id, contacts: list });
+      list.forEach(c => dispatch({ type: 'UPSERT_ALL_CONTACT', contact: c }));
+    }
   }
   async function remove(contact) {
     if (!window.confirm(`Delete contact ${contact.first_name} ${contact.last_name || ''}?`)) return;
     const { error } = await supabase.from('contacts').delete().eq('id', contact.id);
     if (error) return notify(dispatch, error.message, 'error');
     dispatch({ type: 'REMOVE_CONTACT', id: contact.id, accountId: account.id });
+    dispatch({ type: 'REMOVE_ALL_CONTACT', id: contact.id });
   }
 
   return (
@@ -1937,7 +2272,10 @@ function ContactModal() {
     if (result.error) return notify(dispatch, result.error.message, 'error');
     // Refresh contacts to handle primary trigger side effects
     const { data: list } = await supabase.from('contacts').select('*').eq('account_id', accountId).order('is_primary', { ascending: false });
-    if (list) dispatch({ type: 'LOAD_CONTACTS', accountId, contacts: list });
+    if (list) {
+      dispatch({ type: 'LOAD_CONTACTS', accountId, contacts: list });
+      list.forEach(c => dispatch({ type: 'UPSERT_ALL_CONTACT', contact: c }));
+    }
     dispatch({ type: 'CLOSE_MODAL' });
     notify(dispatch, editing ? 'Contact updated.' : 'Contact added.');
   }
@@ -2584,12 +2922,14 @@ function App() {
     if (!state.user) return;
     (async () => {
       dispatch({ type: 'SET_LOADING', loading: true });
-      const [{ data: profs }, { data: accs }] = await Promise.all([
+      const [{ data: profs }, { data: accs }, { data: ctcs }] = await Promise.all([
         supabase.from('profiles').select('*').order('full_name', { ascending: true }),
         supabase.from('accounts').select('*').neq('status', 'deleted').order('updated_at', { ascending: false }),
+        supabase.from('contacts').select('*').order('created_at', { ascending: false }),
       ]);
       if (profs) dispatch({ type: 'SET_PROFILES', profiles: profs });
       if (accs) dispatch({ type: 'LOAD_ACCOUNTS', accounts: accs });
+      if (ctcs) dispatch({ type: 'SET_ALL_CONTACTS', contacts: ctcs });
       dispatch({ type: 'SET_LOADING', loading: false });
     })();
   }, [state.user?.id]);
@@ -2637,7 +2977,9 @@ function App() {
           ? <CalendarView />
           : state.route.name === 'detail'
             ? <AccountDetailView accountId={state.route.accountId} />
-            : <AccountListView />}
+            : state.route.tab === 'contacts'
+              ? <ContactListView />
+              : <AccountListView />}
       </div>
       {state.modal === 'add_account' && <AddAccountModal />}
       {state.modal === 'add_contact' && <ContactModal />}
