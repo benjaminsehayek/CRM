@@ -10,6 +10,7 @@
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script type="module">
   import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
   window.__createSupabaseClient = createClient;
@@ -37,6 +38,12 @@
    ===================================================================== */
 const SUPABASE_URL = 'https://zljokoskuokybdiqqhpy.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_L5Hb-qqsAcN6RLhkdTwYPA_hxPogZiT';
+
+// Google Calendar OAuth — paste your OAuth Client ID from Google Cloud Console
+// (APIs & Services → Credentials → OAuth 2.0 Client IDs → Web application).
+// Leave blank until set; the Calendar feature will show a setup notice.
+const GOOGLE_CLIENT_ID = '';
+const GOOGLE_CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
 
 /* =====================================================================
    ENUM TABLES (kept in sync with abm-crm-schema.sql)
@@ -184,6 +191,137 @@ function classNames(...xs) { return xs.filter(Boolean).join(' '); }
 function safe(v) { return (v === null || v === undefined) ? '' : v; }
 function uniq(arr) { return Array.from(new Set(arr)); }
 
+function startOfWeek(d) {
+  const x = new Date(d); x.setHours(0,0,0,0);
+  const day = x.getDay(); // 0 Sun .. 6 Sat
+  x.setDate(x.getDate() - day);
+  return x;
+}
+function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+function fmtDayShort(d) { return d.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' }); }
+function fmtTime(d) { return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }); }
+function sameDay(a, b) { return a.getFullYear()===b.getFullYear() && a.getMonth()===b.getMonth() && a.getDate()===b.getDate(); }
+
+/* =====================================================================
+   GOOGLE CALENDAR — browser-only OAuth via Google Identity Services
+   ===================================================================== */
+const GCAL_STORAGE_KEY = 'crm.gcal.token';
+
+const gcal = {
+  tokenClient: null,
+  loaded: false,
+
+  init() {
+    if (this.loaded || !window.google?.accounts?.oauth2 || !GOOGLE_CLIENT_ID) return;
+    this.tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: GOOGLE_CALENDAR_SCOPE,
+      callback: () => {}, // set per-call
+    });
+    this.loaded = true;
+  },
+
+  saveToken(tok) {
+    const record = { access_token: tok.access_token, expires_at: Date.now() + (tok.expires_in - 60) * 1000 };
+    try { localStorage.setItem(GCAL_STORAGE_KEY, JSON.stringify(record)); } catch {}
+    return record;
+  },
+
+  loadToken() {
+    try {
+      const raw = localStorage.getItem(GCAL_STORAGE_KEY);
+      if (!raw) return null;
+      const rec = JSON.parse(raw);
+      if (!rec.access_token || !rec.expires_at) return null;
+      return rec;
+    } catch { return null; }
+  },
+
+  clearToken() { try { localStorage.removeItem(GCAL_STORAGE_KEY); } catch {} },
+
+  isConnected() {
+    const t = this.loadToken();
+    return !!(t && t.expires_at > Date.now());
+  },
+
+  // Returns a valid access token, doing a silent (prompt='') refresh if needed.
+  // Falls back to a user-visible consent popup if silent refresh fails.
+  async getAccessToken({ interactive = false } = {}) {
+    this.init();
+    if (!this.tokenClient) throw new Error('Google Identity Services not loaded yet — try again in a second, or check that GOOGLE_CLIENT_ID is set.');
+
+    const cached = this.loadToken();
+    if (cached && cached.expires_at > Date.now() + 30 * 1000) return cached.access_token;
+
+    return new Promise((resolve, reject) => {
+      this.tokenClient.callback = (resp) => {
+        if (resp.error) return reject(new Error(resp.error_description || resp.error));
+        const rec = this.saveToken(resp);
+        resolve(rec.access_token);
+      };
+      try {
+        this.tokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+      } catch (e) { reject(e); }
+    });
+  },
+
+  signOut() {
+    const t = this.loadToken();
+    if (t?.access_token && window.google?.accounts?.oauth2) {
+      try { window.google.accounts.oauth2.revoke(t.access_token, () => {}); } catch {}
+    }
+    this.clearToken();
+  },
+
+  async apiFetch(path, { method = 'GET', body = null, query = null, interactive = false } = {}) {
+    const token = await this.getAccessToken({ interactive });
+    const url = new URL('https://www.googleapis.com/calendar/v3' + path);
+    if (query) Object.entries(query).forEach(([k, v]) => v != null && url.searchParams.append(k, v));
+    const res = await fetch(url.toString(), {
+      method,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : null,
+    });
+    if (res.status === 401) {
+      this.clearToken();
+      throw new Error('Google session expired — click Reconnect Calendar.');
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Google API error ${res.status}`);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  },
+
+  async listEvents({ timeMin, timeMax, maxResults = 100 }) {
+    const data = await this.apiFetch('/calendars/primary/events', {
+      query: {
+        timeMin: timeMin.toISOString(),
+        timeMax: timeMax.toISOString(),
+        singleEvents: true,
+        orderBy: 'startTime',
+        maxResults,
+      },
+    });
+    return data.items || [];
+  },
+
+  async createEvent({ summary, description, startISO, endISO, attendees, location }) {
+    return this.apiFetch('/calendars/primary/events', {
+      method: 'POST',
+      query: { sendUpdates: 'all' },
+      body: {
+        summary, description, location,
+        start: { dateTime: startISO },
+        end:   { dateTime: endISO },
+        attendees: (attendees || []).filter(Boolean).map(email => ({ email })),
+        source: { title: 'Crocs & Clicks CRM', url: window.location.origin + window.location.pathname },
+      },
+    });
+  },
+};
+
 /* =====================================================================
    APP STATE — Context + useReducer
    ===================================================================== */
@@ -214,11 +352,13 @@ const initialState = {
   modalProps: {},
   savedViews: [],
   route: parseHash(window.location.hash),
+  googleConnected: false,
 };
 
 function parseHash(hash) {
   const h = (hash || '').replace(/^#\/?/, '');
   if (!h || h === 'accounts') return { name: 'list' };
+  if (h === 'calendar') return { name: 'calendar' };
   const m = h.match(/^accounts\/([0-9a-fA-F-]{36})$/);
   if (m) return { name: 'detail', accountId: m[1] };
   return { name: 'list' };
@@ -272,6 +412,7 @@ function appReducer(state, action) {
     }
     case 'SET_SAVED_VIEWS':  return { ...state, savedViews: action.views };
     case 'SET_ROUTE':        return { ...state, route: action.route };
+    case 'SET_GOOGLE':       return { ...state, googleConnected: !!action.connected };
     case 'APPLY_VIEW':       return { ...state, filters: { ...initialState.filters, ...action.filters }, sort: action.sort || state.sort };
     default: return state;
   }
@@ -432,21 +573,50 @@ function TopBar() {
   const [menuOpen, setMenuOpen] = useState(false);
 
   function goList() { window.location.hash = '#/accounts'; }
+  function goCalendar() { window.location.hash = '#/calendar'; }
+
+  async function connectGoogle() {
+    try {
+      await gcal.getAccessToken({ interactive: true });
+      dispatch({ type: 'SET_GOOGLE', connected: true });
+      notify(dispatch, 'Google Calendar connected.');
+      setMenuOpen(false);
+    } catch (e) {
+      notify(dispatch, e.message, 'error');
+    }
+  }
+  function disconnectGoogle() {
+    gcal.signOut();
+    dispatch({ type: 'SET_GOOGLE', connected: false });
+    notify(dispatch, 'Google Calendar disconnected.');
+    setMenuOpen(false);
+  }
+
+  const navItemCls = (active) => classNames(
+    'px-2 py-1 text-sm rounded',
+    active ? 'bg-gray-100 text-gray-900 font-medium' : 'text-gray-600 hover:text-gray-900'
+  );
 
   return (
     <div className="bg-white border-b border-gray-200 px-4 py-2 flex items-center gap-3">
       <button onClick={goList} className="font-semibold text-gray-900 hover:text-gray-700 text-sm">
         Crocs &amp; Clicks CRM
       </button>
+      <nav className="flex items-center gap-1 ml-2">
+        <button onClick={goList} className={navItemCls(state.route.name === 'list' || state.route.name === 'detail')}>Accounts</button>
+        <button onClick={goCalendar} className={navItemCls(state.route.name === 'calendar')}>Calendar</button>
+      </nav>
       <div className="flex-1 max-w-xl">
-        <input
-          type="text"
-          placeholder="Search accounts (name, phone, website, street)…   /"
-          value={state.filters.search}
-          onChange={e => dispatch({ type: 'SET_FILTERS', filters: { search: e.target.value } })}
-          className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded ring-focus"
-          id="global-search"
-        />
+        {state.route.name !== 'calendar' && (
+          <input
+            type="text"
+            placeholder="Search accounts (name, phone, website, street)…   /"
+            value={state.filters.search}
+            onChange={e => dispatch({ type: 'SET_FILTERS', filters: { search: e.target.value } })}
+            className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded ring-focus"
+            id="global-search"
+          />
+        )}
       </div>
       <div className="ml-auto flex items-center gap-2">
         <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'import' })}>Import CSV</Button>
@@ -456,10 +626,26 @@ function TopBar() {
             {(state.profile?.full_name || '?').slice(0,2).toUpperCase()}
           </button>
           {menuOpen && (
-            <div className="absolute right-0 top-9 bg-white border border-gray-200 rounded shadow-md min-w-[200px] z-30">
+            <div className="absolute right-0 top-9 bg-white border border-gray-200 rounded shadow-md min-w-[240px] z-30">
               <div className="px-3 py-2 border-b border-gray-200">
                 <div className="text-sm font-medium text-gray-900">{state.profile?.full_name}</div>
                 <div className="text-xs text-gray-500">{state.profile?.role}</div>
+              </div>
+              <div className="px-3 py-2 border-b border-gray-200">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-gray-700">Google Calendar</span>
+                  <span className={classNames('text-xs px-1.5 py-0.5 rounded',
+                    state.googleConnected ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-600')}>
+                    {state.googleConnected ? 'Connected' : 'Not connected'}
+                  </span>
+                </div>
+                {state.googleConnected ? (
+                  <button onClick={disconnectGoogle} className="mt-1.5 text-xs text-red-600 hover:underline">Disconnect</button>
+                ) : (
+                  <button onClick={connectGoogle} className="mt-1.5 text-xs text-blue-600 hover:underline">
+                    {GOOGLE_CLIENT_ID ? 'Connect Google Calendar' : 'Setup required (see GOOGLE_CLIENT_ID)'}
+                  </button>
+                )}
               </div>
               <button className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50" onClick={async () => { await supabase.auth.signOut(); setMenuOpen(false); }}>
                 Sign out
@@ -917,6 +1103,265 @@ function AccountListView() {
 }
 
 /* =====================================================================
+   CALENDAR VIEW — Google Calendar embedded inside the CRM
+   ===================================================================== */
+function CalendarView() {
+  const { state, dispatch } = useApp();
+  const [tab, setTab] = useState('week');
+  const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()));
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  // CRM meetings (from accounts.meeting_at) as second source
+  const crmMeetings = useMemo(() => {
+    const acctMap = Object.fromEntries(state.accounts.map(a => [a.id, a]));
+    return state.accounts
+      .filter(a => a.meeting_at && a.status === 'active')
+      .map(a => ({
+        id: 'crm-' + a.id,
+        summary: `Meeting · ${a.name}`,
+        start: new Date(a.meeting_at),
+        end: new Date(new Date(a.meeting_at).getTime() + 30 * 60 * 1000),
+        crmAccountId: a.id,
+        source: 'crm',
+      }));
+  }, [state.accounts]);
+
+  async function loadEvents(start, end) {
+    if (!state.googleConnected) { setEvents([]); return; }
+    setLoading(true); setErr('');
+    try {
+      const items = await gcal.listEvents({ timeMin: start, timeMax: end, maxResults: 250 });
+      setEvents(items.map(ev => ({
+        id: ev.id,
+        summary: ev.summary || '(no title)',
+        description: ev.description,
+        location: ev.location,
+        start: new Date(ev.start?.dateTime || ev.start?.date),
+        end: new Date(ev.end?.dateTime || ev.end?.date),
+        allDay: !!ev.start?.date,
+        attendees: ev.attendees,
+        htmlLink: ev.htmlLink,
+        source: 'google',
+      })));
+    } catch (e) {
+      setErr(e.message);
+      setEvents([]);
+    } finally { setLoading(false); }
+  }
+
+  useEffect(() => {
+    if (tab === 'week') {
+      loadEvents(weekStart, addDays(weekStart, 7));
+    } else {
+      const now = new Date(); now.setHours(0,0,0,0);
+      loadEvents(now, addDays(now, 30));
+    }
+  }, [tab, weekStart, state.googleConnected]);
+
+  if (!GOOGLE_CLIENT_ID) {
+    return (
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="max-w-md text-center">
+          <div className="text-base font-medium text-gray-800 mb-2">Calendar setup required</div>
+          <div className="text-sm text-gray-600">
+            Set <code className="bg-gray-100 px-1 rounded">GOOGLE_CLIENT_ID</code> in <code>index.html</code> with your Google Cloud OAuth client ID, then reload.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!state.googleConnected) {
+    return (
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="max-w-md text-center">
+          <div className="text-base font-medium text-gray-800 mb-2">Connect your Google Calendar</div>
+          <div className="text-sm text-gray-600 mb-4">
+            Pulls events from your primary Google Calendar so you see meetings and personal conflicts in one place. Meetings booked in the CRM get pushed back to Google automatically.
+          </div>
+          <Button onClick={async () => {
+            try {
+              await gcal.getAccessToken({ interactive: true });
+              dispatch({ type: 'SET_GOOGLE', connected: true });
+            } catch (e) { notify(dispatch, e.message, 'error'); }
+          }}>Connect Google Calendar</Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="bg-white border-b border-gray-200 px-4 py-2 flex items-center gap-3">
+        <div className="flex items-center gap-1 rounded border border-gray-300 overflow-hidden">
+          <button onClick={() => setTab('week')}
+            className={classNames('px-3 py-1 text-sm', tab === 'week' ? 'bg-gray-900 text-white' : 'bg-white text-gray-700')}>Week</button>
+          <button onClick={() => setTab('agenda')}
+            className={classNames('px-3 py-1 text-sm', tab === 'agenda' ? 'bg-gray-900 text-white' : 'bg-white text-gray-700')}>Agenda</button>
+        </div>
+        {tab === 'week' && (
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" size="sm" onClick={() => setWeekStart(addDays(weekStart, -7))}>← Prev</Button>
+            <Button variant="secondary" size="sm" onClick={() => setWeekStart(startOfWeek(new Date()))}>Today</Button>
+            <Button variant="secondary" size="sm" onClick={() => setWeekStart(addDays(weekStart, 7))}>Next →</Button>
+            <span className="text-sm text-gray-700 ml-2">
+              {weekStart.toLocaleDateString(undefined, { month: 'long', day: 'numeric' })} – {addDays(weekStart, 6).toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' })}
+            </span>
+          </div>
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          {loading && <span className="text-xs text-gray-500">Loading…</span>}
+          {err && <span className="text-xs text-red-600">{err}</span>}
+        </div>
+      </div>
+      {tab === 'week'
+        ? <WeekGrid weekStart={weekStart} events={events} crmMeetings={crmMeetings} />
+        : <AgendaList events={events} crmMeetings={crmMeetings} />}
+    </div>
+  );
+}
+
+const HOUR_PX = 48;
+const DAY_START_HOUR = 7;
+const DAY_END_HOUR = 21;
+
+function WeekGrid({ weekStart, events, crmMeetings }) {
+  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  const weekEnd = addDays(weekStart, 7);
+
+  const dayEvents = days.map(d => {
+    const dayStart = new Date(d); dayStart.setHours(0,0,0,0);
+    const dayEnd = addDays(dayStart, 1);
+    const all = [...events, ...crmMeetings.filter(m => m.start >= weekStart && m.start < weekEnd)];
+    return all
+      .filter(e => !e.allDay && e.end > dayStart && e.start < dayEnd)
+      .sort((a,b) => a.start - b.start);
+  });
+
+  const hours = Array.from({ length: DAY_END_HOUR - DAY_START_HOUR + 1 }, (_, i) => i + DAY_START_HOUR);
+  const totalH = (DAY_END_HOUR - DAY_START_HOUR) * HOUR_PX;
+  const today = new Date(); today.setHours(0,0,0,0);
+
+  return (
+    <div className="flex-1 overflow-auto scrollbar-thin bg-white">
+      <div className="grid" style={{ gridTemplateColumns: `60px repeat(7, minmax(140px, 1fr))` }}>
+        {/* Header row */}
+        <div className="sticky top-0 bg-white border-b border-gray-200 z-10"></div>
+        {days.map((d, i) => (
+          <div key={i} className={classNames('sticky top-0 bg-white border-b border-l border-gray-200 z-10 px-2 py-2',
+            sameDay(d, today) && 'bg-blue-50')}>
+            <div className="text-xs text-gray-500">{d.toLocaleDateString(undefined, { weekday: 'short' })}</div>
+            <div className={classNames('text-base font-medium', sameDay(d, today) ? 'text-blue-700' : 'text-gray-800')}>
+              {d.getDate()}
+            </div>
+          </div>
+        ))}
+
+        {/* Hour gutter */}
+        <div className="relative" style={{ height: totalH }}>
+          {hours.slice(0, -1).map((h, i) => (
+            <div key={h} className="text-xs text-gray-400 text-right pr-1 border-t border-gray-100"
+                 style={{ position: 'absolute', top: i * HOUR_PX, right: 0, height: HOUR_PX, width: '100%' }}>
+              {(h % 12 || 12)} {h < 12 ? 'AM' : 'PM'}
+            </div>
+          ))}
+        </div>
+
+        {/* Day columns */}
+        {days.map((d, i) => (
+          <div key={i} className="relative border-l border-gray-200" style={{ height: totalH }}>
+            {hours.slice(0, -1).map((h, hi) => (
+              <div key={h} className="border-t border-gray-100"
+                   style={{ position: 'absolute', top: hi * HOUR_PX, left: 0, right: 0, height: HOUR_PX }} />
+            ))}
+            {dayEvents[i].map(ev => {
+              const dayStart = new Date(d); dayStart.setHours(DAY_START_HOUR, 0, 0, 0);
+              const startMin = Math.max(0, (ev.start - dayStart) / 60000);
+              const endMin = Math.min((DAY_END_HOUR - DAY_START_HOUR) * 60, (ev.end - dayStart) / 60000);
+              const top = (startMin / 60) * HOUR_PX;
+              const height = Math.max(20, ((endMin - startMin) / 60) * HOUR_PX);
+              const isCrm = ev.source === 'crm';
+              return (
+                <div key={ev.id}
+                  className={classNames('absolute left-0.5 right-0.5 rounded p-1 text-[11px] overflow-hidden cursor-pointer shadow-sm border',
+                    isCrm ? 'bg-blue-100 border-blue-300 text-blue-900' : 'bg-emerald-100 border-emerald-300 text-emerald-900')}
+                  style={{ top, height }}
+                  onClick={() => {
+                    if (isCrm && ev.crmAccountId) window.location.hash = `#/accounts/${ev.crmAccountId}`;
+                    else if (ev.htmlLink) window.open(ev.htmlLink, '_blank');
+                  }}
+                  title={`${ev.summary}\n${fmtTime(ev.start)} – ${fmtTime(ev.end)}`}>
+                  <div className="font-medium truncate">{ev.summary}</div>
+                  <div className="opacity-75">{fmtTime(ev.start)}</div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AgendaList({ events, crmMeetings }) {
+  const all = [...events, ...crmMeetings]
+    .filter(e => e.end > new Date())
+    .sort((a,b) => a.start - b.start);
+
+  const grouped = useMemo(() => {
+    const m = new Map();
+    all.forEach(e => {
+      const key = fmtDate(e.start);
+      if (!m.has(key)) m.set(key, []);
+      m.get(key).push(e);
+    });
+    return Array.from(m.entries());
+  }, [all]);
+
+  if (all.length === 0) {
+    return <div className="flex-1 flex items-center justify-center text-sm text-gray-500">No upcoming events in the next 30 days.</div>;
+  }
+
+  return (
+    <div className="flex-1 overflow-auto scrollbar-thin">
+      <div className="max-w-3xl mx-auto p-4 space-y-4">
+        {grouped.map(([day, items]) => (
+          <div key={day} className="bg-white border border-gray-200 rounded">
+            <div className="px-3 py-2 border-b border-gray-100 bg-gray-50 text-sm font-medium text-gray-700">
+              {new Date(day + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}
+            </div>
+            <div className="divide-y divide-gray-100">
+              {items.map(ev => {
+                const isCrm = ev.source === 'crm';
+                return (
+                  <div key={ev.id} className="px-3 py-2 flex items-start gap-3 hover:bg-gray-50 cursor-pointer"
+                    onClick={() => {
+                      if (isCrm && ev.crmAccountId) window.location.hash = `#/accounts/${ev.crmAccountId}`;
+                      else if (ev.htmlLink) window.open(ev.htmlLink, '_blank');
+                    }}>
+                    <div className={classNames('w-1 self-stretch rounded', isCrm ? 'bg-blue-400' : 'bg-emerald-400')} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-gray-900">{ev.summary}</div>
+                      <div className="text-xs text-gray-500 mt-0.5">
+                        {ev.allDay ? 'All day' : `${fmtTime(ev.start)} – ${fmtTime(ev.end)}`}
+                        {ev.location && <> · {ev.location}</>}
+                      </div>
+                      {isCrm && <div className="text-[11px] text-blue-700 mt-0.5">CRM meeting · click to open account</div>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
    ACCOUNT DETAIL VIEW
    ===================================================================== */
 function AccountDetailView({ accountId }) {
@@ -1109,11 +1554,44 @@ function InlineField({ label, value, onSave, type='text', options=null, multi=fa
 
 function OverviewTab({ account, canEdit }) {
   const { state, dispatch } = useApp();
+  const contacts = state.contacts[account.id] || [];
 
   async function save(patch) {
+    const prevMeetingAt = account.meeting_at;
     const { error, data } = await supabase.from('accounts').update({ ...patch, updated_by: state.profile.id }).eq('id', account.id).select().single();
     if (error) return notify(dispatch, error.message, 'error');
     dispatch({ type: 'UPSERT_ACCOUNT', account: data });
+
+    // If meeting_at was just set or changed and Google Calendar is connected,
+    // offer to push the meeting to the rep's primary calendar.
+    if ('meeting_at' in patch && patch.meeting_at && patch.meeting_at !== prevMeetingAt) {
+      if (state.googleConnected) {
+        const primary = contacts.find(c => c.is_primary) || contacts[0];
+        const ok = window.confirm(`Also create this meeting on your Google Calendar?\n\n${account.name}\n${new Date(patch.meeting_at).toLocaleString()}${primary?.email ? `\nInvite: ${primary.email}` : ''}`);
+        if (ok) {
+          try {
+            const start = new Date(patch.meeting_at);
+            const end = new Date(start.getTime() + 30 * 60 * 1000);
+            await gcal.createEvent({
+              summary: `${account.name} — Discovery`,
+              description: `Crocs & Clicks CRM\nAccount: ${account.name}\n${window.location.origin}${window.location.pathname}#/accounts/${account.id}`,
+              startISO: start.toISOString(),
+              endISO: end.toISOString(),
+              attendees: primary?.email ? [primary.email] : [],
+              location: [account.street, account.city, account.state].filter(Boolean).join(', '),
+            });
+            // Log it on the account so the audit trail reflects the push
+            await supabase.from('activities').insert({
+              account_id: account.id, user_id: state.profile.id, type: 'meeting',
+              subject: 'Meeting scheduled (synced to Google Calendar)',
+              body: primary?.email ? `Invite sent to ${primary.email}` : null,
+              occurred_at: new Date().toISOString(),
+            });
+            notify(dispatch, 'Added to your Google Calendar.');
+          } catch (e) { notify(dispatch, e.message, 'error'); }
+        }
+      }
+    }
   }
 
   const Section = ({ title, children }) => (
@@ -1863,6 +2341,18 @@ function App() {
     } catch {}
   }, []);
 
+  // Google Calendar: reflect stored token state, poll for GIS readiness so the
+  // "Connect" button activates the moment the gsi/client script finishes loading.
+  useEffect(() => {
+    function check() {
+      const connected = gcal.isConnected();
+      dispatch({ type: 'SET_GOOGLE', connected });
+    }
+    check();
+    const t = setInterval(check, 5000);
+    return () => clearInterval(t);
+  }, []);
+
   // auth bootstrap
   useEffect(() => {
     let unsub;
@@ -1941,9 +2431,11 @@ function App() {
     <AppCtx.Provider value={ctx}>
       <div className="h-full flex flex-col">
         <TopBar />
-        {state.route.name === 'list'
-          ? <AccountListView />
-          : <AccountDetailView accountId={state.route.accountId} />}
+        {state.route.name === 'calendar'
+          ? <CalendarView />
+          : state.route.name === 'detail'
+            ? <AccountDetailView accountId={state.route.accountId} />
+            : <AccountListView />}
       </div>
       {state.modal === 'add_account' && <AddAccountModal />}
       {state.modal === 'add_contact' && <ContactModal />}
