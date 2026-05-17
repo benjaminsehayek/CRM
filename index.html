@@ -4086,7 +4086,8 @@ function App() {
         await device.register();
         window.__twilioDevice = device;
       } catch (e) {
-        if (!cancelled) dispatch({ type: 'SET_TWILIO', twilio: { status: 'error', error: e.message || String(e) } });
+        const msg = e?.message || (e ? String(e) : 'Failed to initialize Twilio Device');
+        if (!cancelled) dispatch({ type: 'SET_TWILIO', twilio: { status: 'error', error: msg } });
       }
     })();
 

@@ -144,7 +144,7 @@ async function readForm(req: Request): Promise<URLSearchParams> {
 // ---- Twilio Voice access token (JWT) -------------------------------------
 async function issueAccessToken(identity: string, ttlSec = 3600): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
-  const header = { alg: "HS256", typ: "JWT", cty: "twilio-fpa;v=1" };
+  const header = { typ: "JWT", alg: "HS256", cty: "twilio-fpa;v=1" };
   const payload = {
     jti: `${API_KEY_SID}-${now}`,
     iss: API_KEY_SID,
@@ -469,6 +469,68 @@ Deno.serve(async (req: Request) => {
 
     if (req.method === "GET" && path === "/health") {
       return jsonResponse({ ok: true, numbers: NUMBERS.length });
+    }
+
+    // GET /diagnose — uses the configured credentials to call Twilio's REST API
+    // and verify each ID/secret exists and matches. Helpful for debugging 53000.
+    if (req.method === "GET" && path === "/diagnose") {
+      const out: Record<string, unknown> = {
+        env: {
+          account_sid_prefix: ACCOUNT_SID.slice(0, 6) + "…" + ACCOUNT_SID.slice(-4),
+          api_key_sid_prefix: API_KEY_SID.slice(0, 6) + "…" + API_KEY_SID.slice(-4),
+          twiml_app_sid_prefix: APP_SID.slice(0, 6) + "…" + APP_SID.slice(-4),
+          api_key_secret_len: API_KEY_SEC.length,
+          auth_token_len: AUTH_TOKEN.length,
+          numbers_count: NUMBERS.length,
+        },
+        checks: {} as Record<string, unknown>,
+      };
+
+      const basicAuth = "Basic " + btoa(`${API_KEY_SID}:${API_KEY_SEC}`);
+
+      // 1) Account exists and API key can read it
+      try {
+        const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${ACCOUNT_SID}.json`, {
+          headers: { Authorization: basicAuth },
+        });
+        (out.checks as any).account_lookup = { status: r.status, ok: r.ok };
+        if (r.ok) {
+          const j = await r.json();
+          (out.checks as any).account_lookup.friendly_name = j.friendly_name;
+          (out.checks as any).account_lookup.status = j.status;
+          (out.checks as any).account_lookup.type = j.type;
+        } else {
+          (out.checks as any).account_lookup.body = (await r.text()).slice(0, 500);
+        }
+      } catch (e) { (out.checks as any).account_lookup = { error: (e as Error).message }; }
+
+      // 2) API Key exists in this account
+      try {
+        const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${ACCOUNT_SID}/Keys/${API_KEY_SID}.json`, {
+          headers: { Authorization: basicAuth },
+        });
+        (out.checks as any).api_key_lookup = { status: r.status, ok: r.ok };
+        if (!r.ok) (out.checks as any).api_key_lookup.body = (await r.text()).slice(0, 500);
+      } catch (e) { (out.checks as any).api_key_lookup = { error: (e as Error).message }; }
+
+      // 3) TwiML App exists in this account
+      try {
+        const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${ACCOUNT_SID}/Applications/${APP_SID}.json`, {
+          headers: { Authorization: basicAuth },
+        });
+        (out.checks as any).twiml_app_lookup = { status: r.status, ok: r.ok };
+        if (!r.ok) (out.checks as any).twiml_app_lookup.body = (await r.text()).slice(0, 500);
+      } catch (e) { (out.checks as any).twiml_app_lookup = { error: (e as Error).message }; }
+
+      // 4) Issue a test JWT (no actual Twilio call) so we can inspect claims
+      const test = await issueAccessToken("diagnostic", 60);
+      const [hdr, pay] = test.split(".");
+      (out.checks as any).jwt = {
+        header: JSON.parse(atob(hdr.replace(/-/g, "+").replace(/_/g, "/"))),
+        payload: JSON.parse(atob(pay.replace(/-/g, "+").replace(/_/g, "/"))),
+      };
+
+      return jsonResponse(out);
     }
   } catch (e) {
     console.error("twilio-voice error", e);
