@@ -11,6 +11,7 @@
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://unpkg.com/@twilio/voice-sdk@2.11.3/dist/twilio.min.js"></script>
 <script type="module">
   import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
   window.__createSupabaseClient = createClient;
@@ -44,6 +45,10 @@ const SUPABASE_ANON_KEY = 'sb_publishable_L5Hb-qqsAcN6RLhkdTwYPA_hxPogZiT';
 // Leave blank until set; the Calendar feature will show a setup notice.
 const GOOGLE_CLIENT_ID = '694944470306-v7hetbgag0bj2fn29lbsm27juqtl4ijp.apps.googleusercontent.com';
 const GOOGLE_CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+
+// Twilio Voice — the Supabase Edge Function that mints access tokens and
+// brokers Twilio's webhook callbacks.
+const CALL_FUNCTION_URL = SUPABASE_URL.replace(/\/$/, '') + '/functions/v1/twilio-voice';
 
 /* =====================================================================
    ENUM TABLES (kept in sync with abm-crm-schema.sql)
@@ -391,6 +396,17 @@ const initialState = {
   },
   taskSort: { field: 'due_at', dir: 'asc' },
   taskSelectedIds: [],
+
+  // Calls tab — master list across all accounts
+  allCalls: [],
+  callFilters: {
+    users: [], directions: [], statuses: [], dateRange: 'any', search: '',
+  },
+  callSort: { field: 'started_at', dir: 'desc' },
+  callSelectedIds: [],
+
+  // Twilio Voice — Device status (Device instance itself lives in a ref).
+  twilio: { status: 'idle', error: null },  // idle | registering | ready | error
 };
 
 function parseHash(hash) {
@@ -398,6 +414,7 @@ function parseHash(hash) {
   if (!h || h === 'accounts') return { name: 'list', tab: 'accounts' };
   if (h === 'contacts') return { name: 'list', tab: 'contacts' };
   if (h === 'tasks') return { name: 'list', tab: 'tasks' };
+  if (h === 'calls') return { name: 'list', tab: 'calls' };
   if (h === 'calendar') return { name: 'calendar' };
   const m = h.match(/^accounts\/([0-9a-fA-F-]{36})$/);
   if (m) return { name: 'detail', accountId: m[1] };
@@ -493,6 +510,29 @@ function appReducer(state, action) {
     case 'CLEAR_TASK_SELECTION': return { ...state, taskSelectedIds: [] };
     case 'APPLY_TASK_VIEW':      return { ...state, taskFilters: { ...initialState.taskFilters, ...action.filters }, taskSort: action.sort || state.taskSort };
     case 'APPLY_VIEW':       return { ...state, filters: { ...initialState.filters, ...action.filters }, sort: action.sort || state.sort };
+
+    case 'SET_ALL_CALLS': return { ...state, allCalls: action.calls };
+    case 'UPSERT_CALL': {
+      const i = state.allCalls.findIndex(c => c.id === action.call.id);
+      const next = state.allCalls.slice();
+      if (i >= 0) next[i] = { ...next[i], ...action.call };
+      else next.unshift(action.call);
+      return { ...state, allCalls: next };
+    }
+    case 'REMOVE_CALL': return { ...state, allCalls: state.allCalls.filter(c => c.id !== action.id) };
+    case 'SET_CALL_FILTERS':   return { ...state, callFilters: { ...state.callFilters, ...action.filters } };
+    case 'RESET_CALL_FILTERS': return { ...state, callFilters: initialState.callFilters };
+    case 'SET_CALL_SORT':      return { ...state, callSort: action.sort };
+    case 'TOGGLE_CALL_SELECT': {
+      const has = state.callSelectedIds.includes(action.id);
+      return { ...state, callSelectedIds: has ? state.callSelectedIds.filter(x => x !== action.id) : [...state.callSelectedIds, action.id] };
+    }
+    case 'SET_CALL_SELECTION':   return { ...state, callSelectedIds: action.ids };
+    case 'CLEAR_CALL_SELECTION': return { ...state, callSelectedIds: [] };
+    case 'APPLY_CALL_VIEW':      return { ...state, callFilters: { ...initialState.callFilters, ...action.filters }, callSort: action.sort || state.callSort };
+
+    case 'SET_TWILIO': return { ...state, twilio: { ...state.twilio, ...action.twilio } };
+
     default: return state;
   }
 }
@@ -1021,8 +1061,13 @@ function AccountsTable({ rows }) {
                 </Cell>
                 <Cell k="phone">
                   {a.phone && (
-                    <button onClick={() => { navigator.clipboard.writeText(formatPhone(a.phone)); }} className="hover:text-blue-700" title="Copy">
-                      {formatPhone(a.phone)}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openDialer(dispatch, { to: a.phone, accountId: a.id, accountName: a.name });
+                      }}
+                      className="text-blue-700 hover:underline inline-flex items-center gap-1" title="Dial">
+                      <span>📞</span><span>{formatPhone(a.phone)}</span>
                     </button>
                   )}
                 </Cell>
@@ -1102,6 +1147,7 @@ function ListTabSwitcher() {
         { key: 'accounts', label: 'Accounts' },
         { key: 'contacts', label: 'Contacts' },
         { key: 'tasks',    label: 'Tasks' },
+        { key: 'calls',    label: 'Calls' },
       ].map(t => (
         <button key={t.key}
           onClick={() => { window.location.hash = `#/${t.key}`; }}
@@ -1375,8 +1421,32 @@ function ContactsTable({ rows }) {
                 <td className="px-3 py-2 text-sm text-gray-800">
                   {c.email && <a href={`mailto:${c.email}`} className="hover:underline">{c.email}</a>}
                 </td>
-                <td className="px-3 py-2 text-sm text-gray-800">{c.phone && formatPhone(c.phone)}</td>
-                <td className="px-3 py-2 text-sm text-gray-800">{c.mobile && formatPhone(c.mobile)}</td>
+                <td className="px-3 py-2 text-sm text-gray-800">
+                  {c.phone && (
+                    <button
+                      onClick={() => openDialer(dispatch, {
+                        to: c.phone, accountId: c.account_id, contactId: c.id,
+                        accountName: a?.name,
+                        contactName: `${c.first_name} ${c.last_name || ''}`.trim(),
+                      })}
+                      className="text-blue-700 hover:underline inline-flex items-center gap-1" title="Dial">
+                      <span>📞</span><span>{formatPhone(c.phone)}</span>
+                    </button>
+                  )}
+                </td>
+                <td className="px-3 py-2 text-sm text-gray-800">
+                  {c.mobile && (
+                    <button
+                      onClick={() => openDialer(dispatch, {
+                        to: c.mobile, accountId: c.account_id, contactId: c.id,
+                        accountName: a?.name,
+                        contactName: `${c.first_name} ${c.last_name || ''}`.trim(),
+                      })}
+                      className="text-blue-700 hover:underline inline-flex items-center gap-1" title="Dial">
+                      <span>📞</span><span>{formatPhone(c.mobile)}</span>
+                    </button>
+                  )}
+                </td>
                 <td className="px-3 py-2 text-sm">
                   {c.is_primary ? <Pill className="bg-blue-100 text-blue-800">Primary</Pill> : <span className="text-gray-400">—</span>}
                 </td>
@@ -1805,6 +1875,253 @@ function TaskListView() {
 }
 
 /* =====================================================================
+   CALLS — shared atoms used by both master list and account sub-tab
+   ===================================================================== */
+const CALL_STATUSES = [
+  { value: 'queued',      label: 'Queued',      cls: 'bg-gray-100 text-gray-700' },
+  { value: 'ringing',     label: 'Ringing',     cls: 'bg-amber-100 text-amber-800' },
+  { value: 'in_progress', label: 'In progress', cls: 'bg-blue-100 text-blue-800' },
+  { value: 'completed',   label: 'Completed',   cls: 'bg-green-100 text-green-800' },
+  { value: 'no_answer',   label: 'No answer',   cls: 'bg-gray-100 text-gray-700' },
+  { value: 'busy',        label: 'Busy',        cls: 'bg-amber-100 text-amber-800' },
+  { value: 'failed',      label: 'Failed',      cls: 'bg-red-100 text-red-800' },
+  { value: 'voicemail',   label: 'Voicemail',   cls: 'bg-purple-100 text-purple-800' },
+  { value: 'canceled',    label: 'Canceled',    cls: 'bg-gray-100 text-gray-600' },
+];
+
+const CALL_DIRECTIONS = [
+  { value: 'outbound', label: 'Outbound' },
+  { value: 'inbound',  label: 'Inbound' },
+];
+
+function CallStatusPill({ value }) {
+  if (!value) return <span className="text-gray-400 text-xs">—</span>;
+  return <Pill className={classFor(CALL_STATUSES, value)}>{labelFor(CALL_STATUSES, value)}</Pill>;
+}
+
+function fmtCallDuration(sec) {
+  if (sec == null) return '—';
+  const m = Math.floor(sec / 60); const s = sec % 60;
+  if (m === 0) return `${s}s`;
+  return `${m}m ${s}s`;
+}
+
+function applyCallFilters(calls, f) {
+  const search = (f.search || '').trim().toLowerCase();
+  const now = new Date();
+  const cutoff = (() => {
+    if (f.dateRange === 'today') { const d = new Date(); d.setHours(0,0,0,0); return d; }
+    if (f.dateRange === 'week')  return addDays(startOfWeek(now), 0);
+    if (f.dateRange === 'month') return new Date(now.getFullYear(), now.getMonth(), 1);
+    return null;
+  })();
+  return calls.filter(c => {
+    if (f.users.length && !f.users.includes(c.user_id)) return false;
+    if (f.directions.length && !f.directions.includes(c.direction)) return false;
+    if (f.statuses.length && (!c.status || !f.statuses.includes(c.status))) return false;
+    if (cutoff && new Date(c.started_at) < cutoff) return false;
+    if (search) {
+      const hay = [c.from_number, c.to_number, c.notes, c.voicemail_transcription].map(x => (x || '').toLowerCase()).join(' ');
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+function applyCallSort(calls, accounts, profiles, sort) {
+  const acctMap = Object.fromEntries(accounts.map(a => [a.id, a]));
+  const profileMap = Object.fromEntries(profiles.map(p => [p.id, p]));
+  const k = sort.dir === 'asc' ? 1 : -1;
+  const get = (c) => {
+    switch (sort.field) {
+      case 'account':    return (acctMap[c.account_id]?.name || '').toLowerCase();
+      case 'user':       return (profileMap[c.user_id]?.full_name || '').toLowerCase();
+      case 'direction':  return c.direction || '';
+      case 'duration':   return c.duration_seconds || 0;
+      case 'status':     return c.status || '';
+      case 'started_at':
+      default:           return c.started_at || '';
+    }
+  };
+  return calls.slice().sort((a,b) => {
+    const av = get(a), bv = get(b);
+    if (av < bv) return -1 * k;
+    if (av > bv) return 1 * k;
+    return 0;
+  });
+}
+
+function CallFilterPanel() {
+  const { state, dispatch } = useApp();
+  const [open, setOpen] = useState(true);
+  const f = state.callFilters;
+  const set = (patch) => dispatch({ type: 'SET_CALL_FILTERS', filters: patch });
+
+  return (
+    <div className={classNames('border-r border-gray-200 bg-white transition-all', open ? 'w-72' : 'w-10')}>
+      <div className="flex items-center justify-between p-2 border-b border-gray-200">
+        <button onClick={() => setOpen(o => !o)} className="text-sm font-medium text-gray-700">{open ? 'Filters' : '☰'}</button>
+        {open && (
+          <button onClick={() => dispatch({ type: 'RESET_CALL_FILTERS' })} className="text-xs text-blue-600 hover:underline">Reset</button>
+        )}
+      </div>
+      {open && (
+        <div className="p-3 space-y-3 overflow-y-auto scrollbar-thin" style={{ height: 'calc(100vh - 130px)' }}>
+          <MultiCheckGroup label="Direction" options={CALL_DIRECTIONS} values={f.directions} onChange={v => set({ directions: v })} />
+          <MultiCheckGroup label="Status" options={CALL_STATUSES} values={f.statuses} onChange={v => set({ statuses: v })} />
+          <MultiCheckGroup label="Rep" options={state.profiles.map(p => ({ value: p.id, label: p.full_name }))} values={f.users} onChange={v => set({ users: v })} />
+          <Select label="Date range" value={f.dateRange} onChange={e => set({ dateRange: e.target.value })}
+                  options={[
+                    { value: 'any',   label: 'Any time' },
+                    { value: 'today', label: 'Today' },
+                    { value: 'week',  label: 'This week' },
+                    { value: 'month', label: 'This month' },
+                  ]} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CallsTable({ rows, scopedAccountId = null }) {
+  const { state, dispatch } = useApp();
+  const acctMap = useMemo(() => Object.fromEntries(state.accounts.map(a => [a.id, a])), [state.accounts]);
+  const contactMap = useMemo(() => Object.fromEntries(state.allContacts.map(c => [c.id, c])), [state.allContacts]);
+  const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
+  const sort = state.callSort;
+
+  function sortBy(field) {
+    const next = sort.field === field
+      ? { field, dir: sort.dir === 'asc' ? 'desc' : 'asc' }
+      : { field, dir: 'asc' };
+    dispatch({ type: 'SET_CALL_SORT', sort: next });
+  }
+  function HeaderCell({ k, children, className }) {
+    const isSorted = sort.field === k;
+    return (
+      <th className={classNames('px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap cursor-pointer hover:bg-gray-100', className)} onClick={() => sortBy(k)}>
+        {children}{isSorted && <span className="ml-1">{sort.dir === 'asc' ? '↑' : '↓'}</span>}
+      </th>
+    );
+  }
+
+  return (
+    <div className="flex-1 overflow-auto scrollbar-thin">
+      <table className="min-w-full border-collapse">
+        <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
+          <tr>
+            <HeaderCell k="started_at">When</HeaderCell>
+            <HeaderCell k="direction">Dir</HeaderCell>
+            {!scopedAccountId && <HeaderCell k="account">Account</HeaderCell>}
+            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap">Contact</th>
+            <HeaderCell k="user">Rep</HeaderCell>
+            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap">From → To</th>
+            <HeaderCell k="duration">Duration</HeaderCell>
+            <HeaderCell k="status">Status</HeaderCell>
+            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap">Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(c => {
+            const acct = c.account_id ? acctMap[c.account_id] : null;
+            const contact = c.contact_id ? contactMap[c.contact_id] : null;
+            const user = c.user_id ? profileMap[c.user_id] : null;
+            const isInbound = c.direction === 'inbound';
+            return (
+              <tr key={c.id} className="border-b border-gray-100 row-hover">
+                <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap" title={fmtDateTime(c.started_at)}>{relativeTime(c.started_at)}</td>
+                <td className="px-3 py-2 text-sm">
+                  <span className={classNames('inline-flex items-center', isInbound ? 'text-green-700' : 'text-blue-700')} title={isInbound ? 'Inbound' : 'Outbound'}>
+                    {isInbound ? '↓' : '↑'}
+                  </span>
+                </td>
+                {!scopedAccountId && (
+                  <td className="px-3 py-2 text-sm">
+                    {acct
+                      ? <a href={`#/accounts/${acct.id}`} className="text-blue-700 hover:underline font-medium">{acct.name}</a>
+                      : <span className="text-gray-400">—</span>}
+                  </td>
+                )}
+                <td className="px-3 py-2 text-sm text-gray-800">
+                  {contact ? `${contact.first_name} ${contact.last_name || ''}`.trim() : <span className="text-gray-400">—</span>}
+                </td>
+                <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap">{user?.full_name || (isInbound ? <span className="text-gray-400">—</span> : '?')}</td>
+                <td className="px-3 py-2 text-sm text-gray-700 whitespace-nowrap">
+                  <div>{formatPhone(c.from_number)}</div>
+                  <div className="text-xs text-gray-500">→ {formatPhone(c.to_number)}</div>
+                </td>
+                <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap">{fmtCallDuration(c.duration_seconds)}</td>
+                <td className="px-3 py-2 text-sm"><CallStatusPill value={c.status} /></td>
+                <td className="px-3 py-2 text-sm text-gray-700 max-w-xs">
+                  {c.voicemail_url && (
+                    <div className="text-xs mb-0.5">
+                      <a href={c.voicemail_url} target="_blank" rel="noopener" className="text-purple-700 hover:underline">▶ Voicemail{c.voicemail_duration_seconds ? ` (${c.voicemail_duration_seconds}s)` : ''}</a>
+                    </div>
+                  )}
+                  {c.voicemail_transcription && <div className="text-xs italic text-gray-600 truncate-cell" title={c.voicemail_transcription}>"{c.voicemail_transcription}"</div>}
+                  {c.notes && <div className="text-xs truncate-cell" title={c.notes}>{c.notes}</div>}
+                </td>
+              </tr>
+            );
+          })}
+          {rows.length === 0 && (
+            <tr>
+              <td colSpan={scopedAccountId ? 8 : 9} className="text-center py-12 text-sm text-gray-500">
+                <div className="font-medium text-gray-700 mb-1">No calls yet.</div>
+                <div className="text-xs">Click any phone number to dial.</div>
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CallListView() {
+  const { state, dispatch } = useApp();
+  const filtered = useMemo(
+    () => applyCallFilters(state.allCalls, state.callFilters),
+    [state.allCalls, state.callFilters]
+  );
+  const sorted = useMemo(
+    () => applyCallSort(filtered, state.accounts, state.profiles, state.callSort),
+    [filtered, state.accounts, state.profiles, state.callSort]
+  );
+
+  return (
+    <div className="flex flex-1 overflow-hidden">
+      <CallFilterPanel />
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <ListTabSwitcher />
+        <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
+          <span className="text-sm text-gray-600">{sorted.length} call{sorted.length === 1 ? '' : 's'}</span>
+          <div className="ml-auto flex items-center gap-2">
+            <div className="w-72">
+              <Input
+                placeholder="Search notes, transcription, number…"
+                value={state.callFilters.search}
+                onChange={e => dispatch({ type: 'SET_CALL_FILTERS', filters: { search: e.target.value } })}
+              />
+            </div>
+          </div>
+        </div>
+        {state.allCalls.length === 0 && !state.loading ? (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="text-center max-w-sm">
+              <div className="text-base font-medium text-gray-800 mb-1">No calls yet</div>
+              <div className="text-sm text-gray-500 mb-4">Click any phone number on an account or contact to make your first call.</div>
+            </div>
+          </div>
+        ) : (
+          <CallsTable rows={sorted} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
    CALENDAR VIEW — Google Calendar embedded inside the CRM
    ===================================================================== */
 function CalendarView() {
@@ -2167,6 +2484,22 @@ function AccountDetailView({ accountId }) {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {(() => {
+              const primary = contacts.find(c => c.is_primary) || contacts[0];
+              const dialNumber = primary?.phone || primary?.mobile || account.phone;
+              if (!dialNumber) return null;
+              return (
+                <Button size="sm"
+                  onClick={() => openDialer(dispatch, {
+                    to: dialNumber, accountId: account.id,
+                    contactId: primary?.id || null,
+                    accountName: account.name,
+                    contactName: primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null,
+                  })}>
+                  📞 Dial
+                </Button>
+              );
+            })()}
             <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_meeting', props: { accountId } })}>📅 Schedule meeting</Button>
             <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_task', props: { accountId } })}>+ Task</Button>
             <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId } })}>Log activity</Button>
@@ -2180,22 +2513,27 @@ function AccountDetailView({ accountId }) {
         </div>
 
         <div className="border-b border-gray-200 flex gap-4 sticky top-0 bg-gray-50 z-10">
-          {['overview','contacts','tasks','activity','notes'].map(t => (
-            <button key={t} onClick={() => setTab(t)}
-              className={classNames('px-1 py-2 text-sm font-medium border-b-2',
-                tab === t ? 'border-blue-600 text-blue-700' : 'border-transparent text-gray-600 hover:text-gray-900')}>
-              {t === 'overview' ? 'Overview'
-                : t === 'contacts' ? `Contacts${contacts.length ? ` (${contacts.length})` : ''}`
-                : t === 'tasks' ? `Tasks${state.allTasks.filter(x => x.account_id === account.id && !x.completed_at).length ? ` (${state.allTasks.filter(x => x.account_id === account.id && !x.completed_at).length})` : ''}`
-                : t === 'activity' ? `Activity${activities.length ? ` (${activities.length})` : ''}`
-                : 'Notes'}
-            </button>
-          ))}
+          {['overview','contacts','calls','tasks','activity','notes'].map(t => {
+            const callCount = state.allCalls.filter(x => x.account_id === account.id).length;
+            return (
+              <button key={t} onClick={() => setTab(t)}
+                className={classNames('px-1 py-2 text-sm font-medium border-b-2',
+                  tab === t ? 'border-blue-600 text-blue-700' : 'border-transparent text-gray-600 hover:text-gray-900')}>
+                {t === 'overview' ? 'Overview'
+                  : t === 'contacts' ? `Contacts${contacts.length ? ` (${contacts.length})` : ''}`
+                  : t === 'calls' ? `Calls${callCount ? ` (${callCount})` : ''}`
+                  : t === 'tasks' ? `Tasks${state.allTasks.filter(x => x.account_id === account.id && !x.completed_at).length ? ` (${state.allTasks.filter(x => x.account_id === account.id && !x.completed_at).length})` : ''}`
+                  : t === 'activity' ? `Activity${activities.length ? ` (${activities.length})` : ''}`
+                  : 'Notes'}
+              </button>
+            );
+          })}
         </div>
 
         <div className="py-4">
           {tab === 'overview' && <OverviewTab account={account} canEdit={canEdit} />}
           {tab === 'contacts' && <ContactsTab account={account} contacts={contacts} canEdit={canEdit} />}
+          {tab === 'calls' && <AccountCallsTab account={account} contacts={contacts} />}
           {tab === 'tasks' && <TasksTab account={account} />}
           {tab === 'activity' && <ActivityTab account={account} activities={activities} contacts={contacts} />}
           {tab === 'notes' && <NotesTab account={account} canEdit={canEdit} />}
@@ -2429,10 +2767,32 @@ function ContactsTab({ account, contacts, canEdit }) {
                   {c.is_primary && <Pill className="bg-blue-100 text-blue-800">Primary</Pill>}
                 </div>
                 {c.title && <div className="text-xs text-gray-600">{c.title}</div>}
-                <div className="text-xs text-gray-600 mt-1 flex flex-wrap gap-x-4 gap-y-0.5">
+                <div className="text-xs text-gray-600 mt-1 flex flex-wrap gap-x-4 gap-y-0.5 items-center">
                   {c.email && <a href={`mailto:${c.email}`} className="text-blue-600 hover:underline">{c.email}</a>}
-                  {c.phone && <span>Phone: {formatPhone(c.phone)}</span>}
-                  {c.mobile && <span>Mobile: {formatPhone(c.mobile)}</span>}
+                  {c.phone && (
+                    <span className="inline-flex items-center gap-1">
+                      Phone: {formatPhone(c.phone)}
+                      <button
+                        onClick={() => openDialer(dispatch, {
+                          to: c.phone, accountId: account.id, contactId: c.id,
+                          accountName: account.name,
+                          contactName: `${c.first_name} ${c.last_name || ''}`.trim(),
+                        })}
+                        className="ml-1 text-blue-600 hover:text-blue-800" title="Dial">📞</button>
+                    </span>
+                  )}
+                  {c.mobile && (
+                    <span className="inline-flex items-center gap-1">
+                      Mobile: {formatPhone(c.mobile)}
+                      <button
+                        onClick={() => openDialer(dispatch, {
+                          to: c.mobile, accountId: account.id, contactId: c.id,
+                          accountName: account.name,
+                          contactName: `${c.first_name} ${c.last_name || ''}`.trim(),
+                        })}
+                        className="ml-1 text-blue-600 hover:text-blue-800" title="Dial">📞</button>
+                    </span>
+                  )}
                 </div>
                 {c.notes && <div className="text-xs text-gray-700 mt-1.5 whitespace-pre-wrap">{c.notes}</div>}
               </div>
@@ -2562,6 +2922,49 @@ function TasksTab({ account }) {
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+/* =====================================================================
+   CALLS TAB — per-account sub-view of the calls log
+   ===================================================================== */
+function AccountCallsTab({ account, contacts }) {
+  const { state, dispatch } = useApp();
+  const rows = useMemo(() => {
+    const accountCalls = state.allCalls.filter(c => c.account_id === account.id);
+    return applyCallSort(accountCalls, state.accounts, state.profiles, state.callSort);
+  }, [state.allCalls, state.callSort, account.id]);
+
+  const primary = contacts.find(c => c.is_primary) || contacts[0];
+  const fallbackPhone = primary?.phone || primary?.mobile || account.phone;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-sm text-gray-600">
+          {rows.length} call{rows.length === 1 ? '' : 's'}
+          {account.caller_id_number && (
+            <span className="ml-3 text-xs text-gray-500">
+              This account's caller-ID: <span className="font-medium text-gray-700">{formatPhone(account.caller_id_number)}</span>
+            </span>
+          )}
+        </div>
+        {fallbackPhone && (
+          <Button size="sm"
+            onClick={() => openDialer(dispatch, {
+              to: fallbackPhone, accountId: account.id,
+              contactId: primary?.id || null,
+              accountName: account.name,
+              contactName: primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null,
+            })}>
+            📞 Dial {primary ? `${primary.first_name}` : 'main line'}
+          </Button>
+        )}
+      </div>
+      <div className="bg-white border border-gray-200 rounded overflow-hidden">
+        <CallsTable rows={rows} scopedAccountId={account.id} />
+      </div>
     </div>
   );
 }
@@ -3116,6 +3519,189 @@ function MeetingModal() {
   );
 }
 
+/* =====================================================================
+   DIALER MODAL — Twilio Voice click-to-call
+   ===================================================================== */
+function DialerModal() {
+  const { state, dispatch } = useApp();
+  const { to, accountId, contactId, accountName, contactName } = state.modalProps || {};
+  const account = useMemo(() => accountId ? state.accounts.find(a => a.id === accountId) : null, [accountId, state.accounts]);
+
+  // 'idle' | 'connecting' | 'on_call' | 'ended' | 'error'
+  const [status, setStatus] = useState('idle');
+  const [errorMsg, setErrorMsg] = useState('');
+  const [duration, setDuration] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+  const [notes, setNotes] = useState('');
+  const callRef = useRef(null);
+  const timerRef = useRef(null);
+  const sidRef = useRef(null);
+
+  function fmtDur(s) { return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; }
+
+  function teardown() {
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    if (callRef.current) { try { callRef.current.disconnect(); } catch {} }
+  }
+
+  async function persistNotes() {
+    const sid = sidRef.current;
+    if (!sid || !notes.trim()) return;
+    await supabase.from('calls').update({ notes: notes.trim() }).eq('twilio_call_sid', sid);
+  }
+
+  async function refreshAccount() {
+    if (!accountId) return;
+    const { data } = await supabase.from('accounts').select('*').eq('id', accountId).single();
+    if (data) dispatch({ type: 'UPSERT_ACCOUNT', account: data });
+  }
+
+  async function closeModal() {
+    teardown();
+    await persistNotes();
+    await refreshAccount();
+    // Reload the user's recent calls so the new row shows in the master list / sub-tab.
+    const { data: cls } = await supabase.from('calls').select('*').order('started_at', { ascending: false }).limit(1000);
+    if (cls) dispatch({ type: 'SET_ALL_CALLS', calls: cls });
+    dispatch({ type: 'CLOSE_MODAL' });
+  }
+
+  async function dial() {
+    const device = window.__twilioDevice;
+    if (!device || state.twilio.status !== 'ready') {
+      setErrorMsg(state.twilio.error || 'Phone system not ready. Refresh the page and try again.');
+      setStatus('error');
+      return;
+    }
+    setStatus('connecting');
+    setErrorMsg('');
+    try {
+      const call = await device.connect({
+        params: {
+          To: to,
+          accountId: accountId || '',
+          contactId: contactId || '',
+          userId: state.profile.id,
+        },
+      });
+      callRef.current = call;
+      sidRef.current = call.parameters?.CallSid || null;
+      call.on('accept', () => {
+        sidRef.current = call.parameters?.CallSid || sidRef.current;
+        setStatus('on_call');
+        const start = Date.now();
+        timerRef.current = setInterval(() => setDuration(Math.floor((Date.now() - start) / 1000)), 250);
+      });
+      call.on('disconnect', () => {
+        setStatus('ended');
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      });
+      call.on('cancel', () => {
+        setStatus('ended');
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      });
+      call.on('reject', () => setStatus('ended'));
+      call.on('error', (err) => {
+        setStatus('error');
+        setErrorMsg(err?.message || 'Call error');
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      });
+    } catch (e) {
+      setStatus('error');
+      setErrorMsg(e?.message || 'Failed to start call');
+    }
+  }
+
+  // Auto-dial as soon as the device is ready.
+  useEffect(() => {
+    if (status === 'idle' && state.twilio.status === 'ready') {
+      dial();
+    }
+  }, [state.twilio.status]);
+
+  // Cleanup on unmount.
+  useEffect(() => () => teardown(), []);
+
+  function hangup() {
+    if (callRef.current) { try { callRef.current.disconnect(); } catch {} }
+  }
+  function toggleMute() {
+    if (callRef.current) {
+      const next = !isMuted;
+      try { callRef.current.mute(next); setIsMuted(next); } catch {}
+    }
+  }
+
+  const callerId = account?.caller_id_number || null;
+  const headline = contactName || accountName || formatPhone(to) || 'Unknown';
+  const subline  = (contactName && accountName) ? accountName : null;
+
+  return (
+    <Modal open={true} onClose={closeModal} title="Dial" width="max-w-md">
+      <div className="space-y-3">
+        <div>
+          <div className="text-xs text-gray-500">Calling</div>
+          <div className="text-lg font-medium text-gray-900">{headline}</div>
+          {subline && <div className="text-sm text-gray-600">{subline}</div>}
+          <div className="text-sm text-gray-700 mt-0.5">{formatPhone(to)}</div>
+        </div>
+
+        <div className="text-xs text-gray-500">
+          From: <span className="font-medium text-gray-700">{callerId ? formatPhone(callerId) : '— assigned automatically on first call —'}</span>
+        </div>
+
+        <div className="min-h-[1.5rem]">
+          {status === 'idle' && state.twilio.status !== 'ready' && (
+            <div className="text-sm text-gray-600">Initializing phone… ({state.twilio.status})</div>
+          )}
+          {status === 'connecting' && <div className="text-sm text-blue-700">Dialing…</div>}
+          {status === 'on_call'    && <div className="text-sm text-green-700">Connected · {fmtDur(duration)}</div>}
+          {status === 'ended'      && <div className="text-sm text-gray-600">Call ended{duration > 0 ? ` (${fmtDur(duration)})` : ''}</div>}
+          {status === 'error'      && <div className="text-sm text-red-700">{errorMsg || 'Error'}</div>}
+        </div>
+
+        <Textarea
+          label="Call notes (saved when you close this dialog)"
+          rows={3}
+          value={notes}
+          onChange={e => setNotes(e.target.value)}
+          disabled={status === 'idle' && state.twilio.status !== 'ready'}
+        />
+
+        <div className="flex justify-end gap-2 pt-2 border-t border-gray-200">
+          {(status === 'connecting' || status === 'on_call') && (
+            <>
+              <Button variant="secondary" onClick={toggleMute}>{isMuted ? 'Unmute' : 'Mute'}</Button>
+              <Button variant="danger" onClick={hangup}>Hang up</Button>
+            </>
+          )}
+          {(status === 'idle' || status === 'ended' || status === 'error') && (
+            <>
+              {(status === 'ended' || status === 'error') && (
+                <Button variant="secondary" onClick={() => { setStatus('idle'); setDuration(0); setErrorMsg(''); sidRef.current = null; dial(); }}>Redial</Button>
+              )}
+              <Button onClick={closeModal}>Close</Button>
+            </>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// Helper: open the dialer modal from anywhere with a clean payload.
+function openDialer(dispatch, { to, accountId, contactId, accountName, contactName }) {
+  const e164 = (() => {
+    const d = digitsOnly(to);
+    if (!d) return null;
+    if (d.length === 11 && d.startsWith('1')) return '+' + d;
+    if (d.length === 10) return '+1' + d;
+    return null;
+  })();
+  if (!e164) { return; }
+  dispatch({ type: 'OPEN_MODAL', modal: 'dialer', props: { to: e164, accountId, contactId, accountName, contactName } });
+}
+
 function ImportModal() {
   const { state, dispatch } = useApp();
   const [step, setStep] = useState(1);
@@ -3440,18 +4026,77 @@ function App() {
     if (!state.user) return;
     (async () => {
       dispatch({ type: 'SET_LOADING', loading: true });
-      const [{ data: profs }, { data: accs }, { data: ctcs }, { data: tsks }] = await Promise.all([
+      const [{ data: profs }, { data: accs }, { data: ctcs }, { data: tsks }, { data: cls }] = await Promise.all([
         supabase.from('profiles').select('*').order('full_name', { ascending: true }),
         supabase.from('accounts').select('*').neq('status', 'deleted').order('updated_at', { ascending: false }),
         supabase.from('contacts').select('*').order('created_at', { ascending: false }),
         supabase.from('tasks').select('*').order('due_at', { ascending: true, nullsFirst: false }),
+        supabase.from('calls').select('*').order('started_at', { ascending: false }).limit(1000),
       ]);
       if (profs) dispatch({ type: 'SET_PROFILES', profiles: profs });
       if (accs) dispatch({ type: 'LOAD_ACCOUNTS', accounts: accs });
       if (ctcs) dispatch({ type: 'SET_ALL_CONTACTS', contacts: ctcs });
       if (tsks) dispatch({ type: 'SET_ALL_TASKS', tasks: tsks });
+      if (cls) dispatch({ type: 'SET_ALL_CALLS', calls: cls });
       dispatch({ type: 'SET_LOADING', loading: false });
     })();
+  }, [state.user?.id]);
+
+  // Twilio Voice — register a Device for this user once authed, refresh token before expiry.
+  const twilioDeviceRef = useRef(null);
+  useEffect(() => {
+    if (!state.user) return;
+    let cancelled = false;
+    let refreshTimer = null;
+
+    async function fetchToken() {
+      const { data: { session } } = await supabase.auth.getSession();
+      const jwt = session?.access_token;
+      if (!jwt) throw new Error('Not signed in.');
+      const res = await fetch(CALL_FUNCTION_URL + '/token', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + jwt, 'Content-Type': 'application/json' },
+      });
+      if (!res.ok) throw new Error('Token endpoint failed (' + res.status + ')');
+      return await res.json();
+    }
+
+    (async () => {
+      if (!window.Twilio?.Device) {
+        if (!cancelled) dispatch({ type: 'SET_TWILIO', twilio: { status: 'error', error: 'Twilio SDK not loaded' } });
+        return;
+      }
+      try {
+        if (!cancelled) dispatch({ type: 'SET_TWILIO', twilio: { status: 'registering', error: null } });
+        const { token } = await fetchToken();
+        if (cancelled) return;
+        const device = new window.Twilio.Device(token, { logLevel: 'warn', closeProtection: true });
+        twilioDeviceRef.current = device;
+        device.on('registered', () => { if (!cancelled) dispatch({ type: 'SET_TWILIO', twilio: { status: 'ready', error: null } }); });
+        device.on('error', (err) => {
+          console.error('Twilio Device error', err);
+          if (!cancelled) dispatch({ type: 'SET_TWILIO', twilio: { status: 'error', error: err?.message || 'Device error' } });
+        });
+        device.on('tokenWillExpire', async () => {
+          try {
+            const { token: fresh } = await fetchToken();
+            device.updateToken(fresh);
+          } catch (e) { console.error('Token refresh failed', e); }
+        });
+        await device.register();
+        window.__twilioDevice = device;
+      } catch (e) {
+        if (!cancelled) dispatch({ type: 'SET_TWILIO', twilio: { status: 'error', error: e.message || String(e) } });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (refreshTimer) clearInterval(refreshTimer);
+      try { twilioDeviceRef.current?.destroy(); } catch {}
+      twilioDeviceRef.current = null;
+      window.__twilioDevice = null;
+    };
   }, [state.user?.id]);
 
   // hash routing
@@ -3501,7 +4146,9 @@ function App() {
               ? <ContactListView />
               : state.route.tab === 'tasks'
                 ? <TaskListView />
-                : <AccountListView />}
+                : state.route.tab === 'calls'
+                  ? <CallListView />
+                  : <AccountListView />}
       </div>
       {state.modal === 'add_account' && <AddAccountModal />}
       {state.modal === 'add_contact' && <ContactModal />}
@@ -3510,6 +4157,7 @@ function App() {
       {state.modal === 'create_meeting' && <MeetingModal />}
       {state.modal === 'create_task' && <TaskModal />}
       {state.modal === 'edit_task' && <TaskModal />}
+      {state.modal === 'dialer' && <DialerModal />}
       <Toast />
     </AppCtx.Provider>
   );
