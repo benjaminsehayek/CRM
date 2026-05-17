@@ -452,9 +452,12 @@ Deno.serve(async (req: Request) => {
     return new Response(null, { headers: corsHeaders() });
   }
 
-  // Supabase mounts the function at /functions/v1/twilio-voice/<subpath>.
+  // Supabase forwards the request with /twilio-voice/<subpath> in the path;
+  // the /functions/v1 prefix is sometimes also present (e.g. local dev).
   const url = new URL(req.url);
-  const path = url.pathname.replace(/^\/functions\/v1\/twilio-voice/, "").replace(/\/+$/, "") || "/";
+  const path = url.pathname
+    .replace(/^(\/functions\/v1)?\/twilio-voice/, "")
+    .replace(/\/+$/, "") || "/";
 
   try {
     if (req.method === "POST" && path === "/token")                  return await handleToken(req);
