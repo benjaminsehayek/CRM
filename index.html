@@ -525,6 +525,12 @@ const initialState = {
   dialerQueue: null, // null | { items, position, status, source, outcomeCounts }
   dialerPanelOpen: false,
 
+  // Cadences (reusable multi-step outreach sequences)
+  cadences: [],
+  cadenceSteps: [],          // flat: includes cadence_id
+  cadenceEnrollments: [],
+  cadenceExecutions: [],
+
   // Twilio Voice — Device status (Device instance itself lives in a ref).
   twilio: { status: 'idle', error: null },  // idle | registering | ready | error
 };
@@ -535,6 +541,7 @@ function parseHash(hash) {
   if (h === 'contacts') return { name: 'list', tab: 'contacts' };
   if (h === 'tasks') return { name: 'list', tab: 'tasks' };
   if (h === 'activity' || h === 'calls') return { name: 'list', tab: 'activity' };
+  if (h === 'cadence' || h === 'cadences') return { name: 'list', tab: 'cadence' };
   if (h === 'dashboard') return { name: 'list', tab: 'dashboard' };
   if (h === 'calendar') return { name: 'calendar' };
   const m = h.match(/^accounts\/([0-9a-fA-F-]{36})$/);
@@ -690,6 +697,21 @@ function appReducer(state, action) {
       return { ...state, dialerPanelOpen: !state.dialerPanelOpen };
     case 'SET_DIALER_PANEL_OPEN':
       return { ...state, dialerPanelOpen: !!action.open };
+
+    case 'SET_CADENCES':       return { ...state, cadences: action.cadences };
+    case 'SET_CADENCE_STEPS':  return { ...state, cadenceSteps: action.steps };
+    case 'SET_CADENCE_ENROLLMENTS': return { ...state, cadenceEnrollments: action.enrollments };
+    case 'UPSERT_CADENCE_ENROLLMENT': {
+      const i = state.cadenceEnrollments.findIndex(e => e.id === action.enrollment.id);
+      const next = state.cadenceEnrollments.slice();
+      if (i >= 0) next[i] = { ...next[i], ...action.enrollment };
+      else next.unshift(action.enrollment);
+      return { ...state, cadenceEnrollments: next };
+    }
+    case 'REMOVE_CADENCE_ENROLLMENT':
+      return { ...state, cadenceEnrollments: state.cadenceEnrollments.filter(e => e.id !== action.id) };
+    case 'SET_CADENCE_EXECUTIONS': return { ...state, cadenceExecutions: action.executions };
+    case 'ADD_CADENCE_EXECUTION': return { ...state, cadenceExecutions: [action.execution, ...state.cadenceExecutions] };
     case 'SET_ALL_ACTIVITIES': return { ...state, allActivities: action.activities };
     case 'UPSERT_ALL_ACTIVITY': {
       const i = state.allActivities.findIndex(a => a.id === action.activity.id);
@@ -1319,6 +1341,7 @@ function ListTabSwitcher() {
         { key: 'contacts',  label: 'Contacts' },
         { key: 'tasks',     label: 'Tasks' },
         { key: 'activity',  label: 'Activity' },
+        { key: 'cadence',   label: 'Cadence' },
         { key: 'dashboard', label: 'Dashboard' },
       ].map(t => (
         <button key={t.key}
@@ -1884,10 +1907,12 @@ function TasksTable({ rows, scopedAccountId = null }) {
   }
 
   async function toggleDone(t) {
-    const patch = { completed_at: t.completed_at ? null : new Date().toISOString() };
+    const completing = !t.completed_at;
+    const patch = { completed_at: completing ? new Date().toISOString() : null };
     const { data, error } = await supabase.from('tasks').update(patch).eq('id', t.id).select().single();
     if (error) return notify(dispatch, error.message, 'error');
     dispatch({ type: 'UPSERT_TASK', task: data });
+    if (completing) await advanceCadenceFromCompletedTask({ taskId: t.id, state, dispatch });
   }
 
   return (
@@ -1978,11 +2003,17 @@ function TaskBulkActionBar() {
   if (sel.length === 0) return null;
 
   async function markDone() {
-    const { error } = await supabase.from('tasks').update({ completed_at: new Date().toISOString() }).in('id', sel);
+    const completedAt = new Date().toISOString();
+    const { error } = await supabase.from('tasks').update({ completed_at: completedAt }).in('id', sel);
     if (error) return notify(dispatch, error.message, 'error');
-    sel.forEach(id => dispatch({ type: 'UPSERT_TASK', task: { id, completed_at: new Date().toISOString() } }));
+    const ids = [...sel];
+    ids.forEach(id => dispatch({ type: 'UPSERT_TASK', task: { id, completed_at: completedAt } }));
     dispatch({ type: 'CLEAR_TASK_SELECTION' });
-    notify(dispatch, `${sel.length} task(s) marked done.`);
+    // Advance any cadences whose current task is in this batch.
+    for (const id of ids) {
+      await advanceCadenceFromCompletedTask({ taskId: id, state, dispatch });
+    }
+    notify(dispatch, `${ids.length} task(s) marked done.`);
   }
   async function deleteSel() {
     if (!window.confirm(`Delete ${sel.length} task(s)?`)) return;
@@ -2910,6 +2941,11 @@ function AccountDetailView({ accountId }) {
               );
             })()}
             <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_meeting', props: { accountId } })}>📅 Schedule meeting</Button>
+            {(() => {
+              const existing = state.cadenceEnrollments.find(e => e.account_id === account.id && e.status !== 'opted_out');
+              if (existing) return null;
+              return <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'enroll_cadence', props: { accountId } })}>🪜 Enroll in cadence</Button>;
+            })()}
             <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_task', props: { accountId } })}>+ Task</Button>
             <Button variant="secondary" size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId } })}>Log activity</Button>
             {canEdit && (
@@ -2920,6 +2956,8 @@ function AccountDetailView({ accountId }) {
             )}
           </div>
         </div>
+
+        <CadenceProgressWidget account={account} />
 
         <div className="border-b border-gray-200 flex gap-4 sticky top-0 bg-gray-50 z-10">
           {['overview','contacts','tasks','activity','notes'].map(t => {
@@ -3338,10 +3376,12 @@ function TasksTab({ account }) {
     .slice().sort((a,b) => (a.due_at || '9999') < (b.due_at || '9999') ? -1 : 1);
 
   async function toggleDone(t) {
-    const patch = { completed_at: t.completed_at ? null : new Date().toISOString() };
+    const completing = !t.completed_at;
+    const patch = { completed_at: completing ? new Date().toISOString() : null };
     const { data, error } = await supabase.from('tasks').update(patch).eq('id', t.id).select().single();
     if (error) return notify(dispatch, error.message, 'error');
     dispatch({ type: 'UPSERT_TASK', task: data });
+    if (completing) await advanceCadenceFromCompletedTask({ taskId: t.id, state, dispatch });
   }
 
   return (
@@ -4116,6 +4156,423 @@ function DialerModal() {
         </div>
       </div>
     </Modal>
+  );
+}
+
+/* =====================================================================
+   CADENCES — multi-step outreach sequences
+   ===================================================================== */
+const CADENCE_STEP_META = {
+  call:              { icon: '📞', label: 'Call' },
+  auto_email_report: { icon: '📊', label: 'Auto SEO report' },
+  personal_email:    { icon: '✉️', label: 'Personal email' },
+  manual_task:       { icon: '📝', label: 'Manual task' },
+};
+
+function getCadenceStepsFor(state, cadenceId) {
+  return state.cadenceSteps
+    .filter(s => s.cadence_id === cadenceId)
+    .sort((a, b) => a.step_order - b.step_order);
+}
+
+function buildCadenceTaskPayload(step, cadence, account, currentUserId) {
+  const due = new Date();
+  due.setDate(due.getDate() + (step.wait_days_before || 0));
+  due.setHours(9, 0, 0, 0);
+  const meta = CADENCE_STEP_META[step.step_type] || { label: 'Cadence step' };
+  const fallbackTitle = `${meta.label} — ${account.name}`;
+  return {
+    account_id: account.id,
+    assignee_id: account.owner_id || currentUserId,
+    created_by: currentUserId,
+    title: step.label ? `${step.label} — ${account.name}` : fallbackTitle,
+    notes: `Step ${step.step_order} of "${cadence.name}" cadence (${meta.label.toLowerCase()})`,
+    due_at: due.toISOString(),
+  };
+}
+
+async function enrollAccountInCadence({ accountId, cadenceId, state, dispatch }) {
+  const cadence = state.cadences.find(c => c.id === cadenceId);
+  const account = state.accounts.find(a => a.id === accountId);
+  if (!cadence || !account) throw new Error('Cadence or account not found');
+
+  const steps = getCadenceStepsFor(state, cadenceId);
+  if (!steps.length) throw new Error('Cadence has no steps');
+
+  // Create the first task
+  const taskPayload = buildCadenceTaskPayload(steps[0], cadence, account, state.profile.id);
+  const { data: task, error: tErr } = await supabase.from('tasks').insert(taskPayload).select().single();
+  if (tErr) throw new Error(tErr.message);
+
+  // Create the enrollment
+  const enrollPayload = {
+    account_id: accountId, cadence_id: cadenceId,
+    enrolled_by: state.profile.id,
+    status: 'active', current_step_order: 1,
+    current_task_id: task.id,
+  };
+  const { data: enrollment, error: eErr } = await supabase.from('cadence_enrollments').insert(enrollPayload).select().single();
+  if (eErr) {
+    // Cleanup the orphaned task if enrollment fails
+    await supabase.from('tasks').delete().eq('id', task.id);
+    throw new Error(eErr.message);
+  }
+
+  dispatch({ type: 'UPSERT_TASK', task });
+  dispatch({ type: 'UPSERT_CADENCE_ENROLLMENT', enrollment });
+  return enrollment;
+}
+
+async function advanceCadenceFromCompletedTask({ taskId, state, dispatch }) {
+  const enrollment = state.cadenceEnrollments.find(e =>
+    e.current_task_id === taskId && e.status === 'active'
+  );
+  if (!enrollment) return;
+  const cadence = state.cadences.find(c => c.id === enrollment.cadence_id);
+  const account = state.accounts.find(a => a.id === enrollment.account_id);
+  if (!cadence || !account) return;
+
+  const steps = getCadenceStepsFor(state, enrollment.cadence_id);
+  const currentStep = steps.find(s => s.step_order === enrollment.current_step_order);
+
+  if (currentStep) {
+    const { data: exec } = await supabase.from('cadence_step_executions').insert({
+      enrollment_id: enrollment.id,
+      step_order: currentStep.step_order,
+      step_type: currentStep.step_type,
+      executed_by: state.profile.id,
+      task_id: taskId,
+      skipped: false,
+    }).select().single();
+    if (exec) dispatch({ type: 'ADD_CADENCE_EXECUTION', execution: exec });
+  }
+
+  const nextStep = steps.find(s => s.step_order === enrollment.current_step_order + 1);
+
+  if (!nextStep) {
+    const { data: updated } = await supabase.from('cadence_enrollments')
+      .update({ status: 'completed', completed_at: new Date().toISOString(), current_task_id: null })
+      .eq('id', enrollment.id).select().single();
+    if (updated) dispatch({ type: 'UPSERT_CADENCE_ENROLLMENT', enrollment: updated });
+    return;
+  }
+
+  const nextTaskPayload = buildCadenceTaskPayload(nextStep, cadence, account, state.profile.id);
+  const { data: nextTask, error: tErr } = await supabase.from('tasks').insert(nextTaskPayload).select().single();
+  if (tErr) { console.error('[cadence] advance failed:', tErr.message); return; }
+
+  const { data: updated } = await supabase.from('cadence_enrollments')
+    .update({ current_step_order: nextStep.step_order, current_task_id: nextTask.id })
+    .eq('id', enrollment.id).select().single();
+
+  if (nextTask) dispatch({ type: 'UPSERT_TASK', task: nextTask });
+  if (updated) dispatch({ type: 'UPSERT_CADENCE_ENROLLMENT', enrollment: updated });
+}
+
+async function stopCadenceEnrollment({ enrollmentId, state, dispatch }) {
+  const enrollment = state.cadenceEnrollments.find(e => e.id === enrollmentId);
+  if (!enrollment) return;
+  // Delete the open task so it doesn't keep haunting the rep
+  if (enrollment.current_task_id) {
+    await supabase.from('tasks').delete().eq('id', enrollment.current_task_id);
+    dispatch({ type: 'REMOVE_TASK', id: enrollment.current_task_id });
+  }
+  await supabase.from('cadence_enrollments').delete().eq('id', enrollmentId);
+  dispatch({ type: 'REMOVE_CADENCE_ENROLLMENT', id: enrollmentId });
+}
+
+function CadenceEnrollModal() {
+  const { state, dispatch } = useApp();
+  const { accountId } = state.modalProps || {};
+  const account = state.accounts.find(a => a.id === accountId);
+  const [cadenceId, setCadenceId] = useState(state.cadences[0]?.id || '');
+  const [busy, setBusy] = useState(false);
+
+  const selectedCadence = state.cadences.find(c => c.id === cadenceId);
+  const stepsPreview = cadenceId ? getCadenceStepsFor(state, cadenceId) : [];
+
+  async function submit() {
+    if (!cadenceId || !accountId) return;
+    setBusy(true);
+    try {
+      await enrollAccountInCadence({ accountId, cadenceId, state, dispatch });
+      notify(dispatch, `${account?.name || 'Account'} enrolled in ${selectedCadence?.name || 'cadence'}.`);
+      dispatch({ type: 'CLOSE_MODAL' });
+    } catch (e) {
+      const msg = e?.message || 'Enroll failed.';
+      notify(dispatch, msg.includes('unique') ? 'Already enrolled in this cadence.' : msg, 'error');
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <Modal open={true} onClose={() => dispatch({ type: 'CLOSE_MODAL' })} title="Enroll in cadence" width="max-w-lg">
+      <div className="space-y-3">
+        {account && (
+          <div className="text-xs text-gray-500">Enrolling <span className="font-medium text-gray-800">{account.name}</span></div>
+        )}
+        <Select label="Cadence" value={cadenceId} onChange={e => setCadenceId(e.target.value)}
+          options={state.cadences.map(c => ({ value: c.id, label: c.name }))} />
+        {selectedCadence?.description && (
+          <div className="text-xs text-gray-600">{selectedCadence.description}</div>
+        )}
+        {stepsPreview.length > 0 && (
+          <div className="bg-gray-50 border border-gray-200 rounded p-3">
+            <div className="text-xs text-gray-500 mb-2">Steps</div>
+            <ol className="space-y-1.5">
+              {stepsPreview.map((s, i) => {
+                const meta = CADENCE_STEP_META[s.step_type] || { icon: '•', label: s.step_type };
+                return (
+                  <li key={s.id} className="flex items-center gap-2 text-sm">
+                    <span className="w-5 text-xs text-gray-400">{i + 1}.</span>
+                    <span>{meta.icon}</span>
+                    <span className="text-gray-800">{s.label || meta.label}</span>
+                    {s.wait_days_before > 0 && i > 0 && (
+                      <span className="text-xs text-gray-500">· wait {s.wait_days_before}d</span>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
+        )}
+        <div className="flex justify-end gap-2 pt-2 border-t border-gray-200">
+          <Button variant="secondary" onClick={() => dispatch({ type: 'CLOSE_MODAL' })}>Cancel</Button>
+          <Button onClick={submit} disabled={busy || !cadenceId}>{busy ? 'Enrolling…' : 'Enroll'}</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function CadenceProgressWidget({ account }) {
+  const { state, dispatch } = useApp();
+  const enrollment = state.cadenceEnrollments.find(e => e.account_id === account.id && e.status !== 'opted_out');
+  if (!enrollment) return null;
+  const cadence = state.cadences.find(c => c.id === enrollment.cadence_id);
+  const steps = getCadenceStepsFor(state, enrollment.cadence_id);
+  const executions = state.cadenceExecutions.filter(x => x.enrollment_id === enrollment.id);
+  const currentTask = state.allTasks.find(t => t.id === enrollment.current_task_id);
+  const isComplete = enrollment.status === 'completed';
+
+  async function stop() {
+    if (!confirm(`Stop "${cadence?.name}" cadence for ${account.name}?`)) return;
+    await stopCadenceEnrollment({ enrollmentId: enrollment.id, state, dispatch });
+    notify(dispatch, 'Cadence stopped.');
+  }
+
+  return (
+    <div className="mb-4 bg-white border border-gray-200 rounded-lg p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-sm font-medium text-gray-800">
+          {cadence?.name || 'Cadence'}
+          {isComplete ? <span className="ml-2 text-xs text-green-700">· Completed</span>
+                      : <span className="ml-2 text-xs text-gray-500">· Step {enrollment.current_step_order} of {steps.length}</span>}
+        </div>
+        {!isComplete && (
+          <Button size="sm" variant="ghost" onClick={stop}>Stop</Button>
+        )}
+      </div>
+      <ol className="space-y-1">
+        {steps.map(s => {
+          const done = executions.some(x => x.step_order === s.step_order);
+          const isCurrent = !isComplete && s.step_order === enrollment.current_step_order;
+          const meta = CADENCE_STEP_META[s.step_type] || { icon: '•', label: s.step_type };
+          return (
+            <li key={s.id} className={classNames(
+              'flex items-center gap-2 text-sm px-2 py-1 rounded',
+              isCurrent && 'bg-blue-50',
+              done && 'text-gray-500',
+            )}>
+              <span className="w-4 text-xs">
+                {done ? '✓' : isCurrent ? '◉' : '○'}
+              </span>
+              <span>{meta.icon}</span>
+              <span className={classNames(done && 'line-through')}>{s.label || meta.label}</span>
+              {isCurrent && currentTask?.due_at && (
+                <span className="ml-auto text-xs text-gray-500">due {fmtDate(currentTask.due_at)}</span>
+              )}
+              {s.wait_days_before > 0 && s.step_order > 1 && (
+                <span className="text-xs text-gray-400">(+{s.wait_days_before}d)</span>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
+function CadenceListView() {
+  const { state, dispatch } = useApp();
+  const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
+  const acctMap    = useMemo(() => Object.fromEntries(state.accounts.map(a => [a.id, a])), [state.accounts]);
+  const cadenceMap = useMemo(() => Object.fromEntries(state.cadences.map(c => [c.id, c])), [state.cadences]);
+  const taskMap    = useMemo(() => Object.fromEntries(state.allTasks.map(t => [t.id, t])), [state.allTasks]);
+  const stepsByCadence = useMemo(() => {
+    const m = {};
+    state.cadences.forEach(c => { m[c.id] = getCadenceStepsFor(state, c.id); });
+    return m;
+  }, [state.cadences, state.cadenceSteps]);
+
+  const [sortField, setSortField] = useState('due_at');
+  const [sortDir, setSortDir]     = useState('asc');
+  const [statusFilter, setStatusFilter] = useState('active');
+  const [stepTypeFilter, setStepTypeFilter] = useState([]);
+
+  const rows = useMemo(() => {
+    const filtered = state.cadenceEnrollments.filter(e => {
+      if (statusFilter !== 'all' && e.status !== statusFilter) return false;
+      if (stepTypeFilter.length) {
+        const steps = stepsByCadence[e.cadence_id] || [];
+        const cur = steps.find(s => s.step_order === e.current_step_order);
+        if (!cur || !stepTypeFilter.includes(cur.step_type)) return false;
+      }
+      return true;
+    });
+    return filtered.map(e => {
+      const steps = stepsByCadence[e.cadence_id] || [];
+      const cur = steps.find(s => s.step_order === e.current_step_order);
+      const task = e.current_task_id ? taskMap[e.current_task_id] : null;
+      const acct = acctMap[e.account_id];
+      return {
+        enrollment: e,
+        account: acct,
+        cadence: cadenceMap[e.cadence_id],
+        currentStep: cur,
+        currentTask: task,
+        rep: acct ? profileMap[acct.owner_id] : null,
+      };
+    });
+  }, [state.cadenceEnrollments, stepsByCadence, taskMap, acctMap, cadenceMap, profileMap, statusFilter, stepTypeFilter]);
+
+  const sorted = useMemo(() => {
+    const k = sortDir === 'asc' ? 1 : -1;
+    const get = (r) => {
+      switch (sortField) {
+        case 'account':  return (r.account?.name || '').toLowerCase();
+        case 'cadence':  return (r.cadence?.name || '').toLowerCase();
+        case 'step':     return r.enrollment.current_step_order || 0;
+        case 'rep':      return (r.rep?.full_name || '').toLowerCase();
+        case 'enrolled': return r.enrollment.enrolled_at || '';
+        case 'due_at':
+        default:         return r.currentTask?.due_at || '9999-12-31';
+      }
+    };
+    return rows.slice().sort((a,b) => {
+      const av = get(a), bv = get(b);
+      if (av < bv) return -1 * k;
+      if (av > bv) return  1 * k;
+      return 0;
+    });
+  }, [rows, sortField, sortDir]);
+
+  function sortBy(field) {
+    if (sortField === field) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
+    else { setSortField(field); setSortDir('asc'); }
+  }
+  function HeaderCell({ k, children }) {
+    const isSorted = sortField === k;
+    return (
+      <th onClick={() => sortBy(k)} className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap cursor-pointer hover:bg-gray-100">
+        {children}{isSorted && <span className="ml-1">{sortDir === 'asc' ? '↑' : '↓'}</span>}
+      </th>
+    );
+  }
+
+  async function markDone(row) {
+    if (!row.currentTask) return;
+    const completedAt = new Date().toISOString();
+    const { data, error } = await supabase.from('tasks').update({ completed_at: completedAt }).eq('id', row.currentTask.id).select().single();
+    if (error) return notify(dispatch, error.message, 'error');
+    if (data) dispatch({ type: 'UPSERT_TASK', task: data });
+    await advanceCadenceFromCompletedTask({ taskId: row.currentTask.id, state, dispatch });
+    notify(dispatch, 'Step complete — cadence advanced.');
+  }
+
+  return (
+    <div className="flex flex-1 overflow-hidden">
+      <div className={classNames('border-r border-gray-200 bg-white transition-all w-72')}>
+        <div className="flex items-center justify-between p-2 border-b border-gray-200">
+          <div className="text-sm font-medium text-gray-700">Filters</div>
+        </div>
+        <div className="p-3 space-y-3">
+          <Select label="Status" value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
+            options={[
+              { value: 'active', label: 'Active' },
+              { value: 'paused', label: 'Paused' },
+              { value: 'completed', label: 'Completed' },
+              { value: 'all', label: 'All' },
+            ]} />
+          <MultiCheckGroup label="Current step type"
+            options={Object.entries(CADENCE_STEP_META).map(([v, m]) => ({ value: v, label: `${m.icon} ${m.label}` }))}
+            values={stepTypeFilter}
+            onChange={v => setStepTypeFilter(v)} />
+        </div>
+      </div>
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <ListTabSwitcher />
+        <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
+          <span className="text-sm text-gray-600">{sorted.length} enrollment{sorted.length === 1 ? '' : 's'}</span>
+        </div>
+        <div className="flex-1 overflow-auto scrollbar-thin">
+          <table className="min-w-full border-collapse">
+            <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
+              <tr>
+                <HeaderCell k="due_at">Due</HeaderCell>
+                <HeaderCell k="account">Account</HeaderCell>
+                <HeaderCell k="cadence">Cadence</HeaderCell>
+                <HeaderCell k="step">Step</HeaderCell>
+                <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap">Type</th>
+                <HeaderCell k="rep">Rep</HeaderCell>
+                <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map(r => {
+                const meta = r.currentStep ? CADENCE_STEP_META[r.currentStep.step_type] : null;
+                const overdue = r.currentTask?.due_at && new Date(r.currentTask.due_at) < new Date() && !r.currentTask.completed_at;
+                const isComplete = r.enrollment.status === 'completed';
+                return (
+                  <tr key={r.enrollment.id} className="border-b border-gray-100 row-hover">
+                    <td className={classNames('px-3 py-2 text-sm whitespace-nowrap', overdue && 'text-red-600 font-medium')}>
+                      {isComplete ? <span className="text-green-700">✓ Completed</span>
+                                  : r.currentTask?.due_at ? fmtDate(r.currentTask.due_at) : '—'}
+                    </td>
+                    <td className="px-3 py-2 text-sm">
+                      {r.account ? <a href={`#/accounts/${r.account.id}`} className="text-blue-700 hover:underline font-medium">{r.account.name}</a> : <span className="text-gray-400">—</span>}
+                    </td>
+                    <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap">{r.cadence?.name || '—'}</td>
+                    <td className="px-3 py-2 text-sm text-gray-700 whitespace-nowrap">
+                      {isComplete
+                        ? <span className="text-gray-500">—</span>
+                        : <>Step {r.enrollment.current_step_order}</>}
+                    </td>
+                    <td className="px-3 py-2 text-sm whitespace-nowrap">
+                      {isComplete ? <span className="text-gray-400">—</span> :
+                        meta ? <><span>{meta.icon}</span> <span className="text-gray-700">{r.currentStep?.label || meta.label}</span></> : '—'}
+                    </td>
+                    <td className="px-3 py-2 text-sm text-gray-700 whitespace-nowrap">{r.rep?.full_name || '—'}</td>
+                    <td className="px-3 py-2 text-right whitespace-nowrap">
+                      {!isComplete && r.currentTask && (
+                        <Button size="sm" variant="secondary" onClick={() => markDone(r)}>Mark done</Button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {sorted.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="text-center py-12 text-sm text-gray-500">
+                    <div className="font-medium text-gray-700 mb-1">No enrollments match.</div>
+                    <div className="text-xs">Open an account and click "Enroll in cadence" to start.</div>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -5061,7 +5518,19 @@ function App() {
     if (!state.user) return;
     (async () => {
       dispatch({ type: 'SET_LOADING', loading: true });
-      const [{ data: profs }, { data: accs }, { data: ctcs }, { data: tsks }, { data: cls }, { data: acts }, { data: chs }] = await Promise.all([
+      const [
+        { data: profs },
+        { data: accs },
+        { data: ctcs },
+        { data: tsks },
+        { data: cls },
+        { data: acts },
+        { data: chs },
+        { data: cadList },
+        { data: cadSteps },
+        { data: enrolls },
+        { data: execs },
+      ] = await Promise.all([
         supabase.from('profiles').select('*').order('full_name', { ascending: true }),
         supabase.from('accounts').select('*').neq('status', 'deleted').order('updated_at', { ascending: false }),
         supabase.from('contacts').select('*').order('created_at', { ascending: false }),
@@ -5069,6 +5538,10 @@ function App() {
         supabase.from('calls').select('*').order('started_at', { ascending: false }).limit(1000),
         supabase.from('activities').select('*').order('occurred_at', { ascending: false }).limit(1000),
         supabase.from('stage_changes').select('*').order('changed_at', { ascending: false }).limit(2000),
+        supabase.from('cadences').select('*').order('created_at', { ascending: true }),
+        supabase.from('cadence_steps').select('*').order('cadence_id').order('step_order'),
+        supabase.from('cadence_enrollments').select('*').order('enrolled_at', { ascending: false }),
+        supabase.from('cadence_step_executions').select('*').order('executed_at', { ascending: false }).limit(1000),
       ]);
       if (profs) dispatch({ type: 'SET_PROFILES', profiles: profs });
       if (accs) dispatch({ type: 'LOAD_ACCOUNTS', accounts: accs });
@@ -5077,6 +5550,10 @@ function App() {
       if (cls) dispatch({ type: 'SET_ALL_CALLS', calls: cls });
       if (acts) dispatch({ type: 'SET_ALL_ACTIVITIES', activities: acts });
       if (chs) dispatch({ type: 'SET_STAGE_CHANGES', changes: chs });
+      if (cadList)  dispatch({ type: 'SET_CADENCES', cadences: cadList });
+      if (cadSteps) dispatch({ type: 'SET_CADENCE_STEPS', steps: cadSteps });
+      if (enrolls)  dispatch({ type: 'SET_CADENCE_ENROLLMENTS', enrollments: enrolls });
+      if (execs)    dispatch({ type: 'SET_CADENCE_EXECUTIONS', executions: execs });
       dispatch({ type: 'SET_LOADING', loading: false });
     })();
   }, [state.user?.id]);
@@ -5190,9 +5667,11 @@ function App() {
                     ? <TaskListView />
                     : state.route.tab === 'activity'
                       ? <ActivityListView />
-                      : state.route.tab === 'dashboard'
-                        ? <DashboardView />
-                        : <AccountListView />}
+                      : state.route.tab === 'cadence'
+                        ? <CadenceListView />
+                        : state.route.tab === 'dashboard'
+                          ? <DashboardView />
+                          : <AccountListView />}
           </div>
           <DialerSidebar />
         </div>
@@ -5207,6 +5686,7 @@ function App() {
       {state.modal === 'dialer' && <DialerModal />}
       {state.modal === 'email' && <EmailModal />}
       {state.modal === 'email_thread' && <EmailThreadModal />}
+      {state.modal === 'enroll_cadence' && <CadenceEnrollModal />}
       <Toast />
     </AppCtx.Provider>
   );
