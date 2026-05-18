@@ -518,6 +518,9 @@ const initialState = {
   activitySort: { field: 'occurred_at', dir: 'desc' },
   allCalls: [],
 
+  // Dashboard — pipeline stage transition audit log
+  stageChanges: [],
+
   // Twilio Voice — Device status (Device instance itself lives in a ref).
   twilio: { status: 'idle', error: null },  // idle | registering | ready | error
 };
@@ -528,6 +531,7 @@ function parseHash(hash) {
   if (h === 'contacts') return { name: 'list', tab: 'contacts' };
   if (h === 'tasks') return { name: 'list', tab: 'tasks' };
   if (h === 'activity' || h === 'calls') return { name: 'list', tab: 'activity' };
+  if (h === 'dashboard') return { name: 'list', tab: 'dashboard' };
   if (h === 'calendar') return { name: 'calendar' };
   const m = h.match(/^accounts\/([0-9a-fA-F-]{36})$/);
   if (m) return { name: 'detail', accountId: m[1] };
@@ -638,6 +642,7 @@ function appReducer(state, action) {
     }
     case 'REMOVE_CALL': return { ...state, allCalls: state.allCalls.filter(c => c.id !== action.id) };
 
+    case 'SET_STAGE_CHANGES': return { ...state, stageChanges: action.changes };
     case 'SET_ALL_ACTIVITIES': return { ...state, allActivities: action.activities };
     case 'UPSERT_ALL_ACTIVITY': {
       const i = state.allActivities.findIndex(a => a.id === action.activity.id);
@@ -1263,10 +1268,11 @@ function ListTabSwitcher() {
   return (
     <div className="bg-white border-b border-gray-200 px-4 py-1.5 flex items-center gap-2">
       {[
-        { key: 'accounts', label: 'Accounts' },
-        { key: 'contacts', label: 'Contacts' },
-        { key: 'tasks',    label: 'Tasks' },
-        { key: 'activity', label: 'Activity' },
+        { key: 'accounts',  label: 'Accounts' },
+        { key: 'contacts',  label: 'Contacts' },
+        { key: 'tasks',     label: 'Tasks' },
+        { key: 'activity',  label: 'Activity' },
+        { key: 'dashboard', label: 'Dashboard' },
       ].map(t => (
         <button key={t.key}
           onClick={() => { window.location.hash = `#/${t.key}`; }}
@@ -2278,6 +2284,158 @@ function ActivityListView() {
         ) : (
           <ActivityTable rows={sorted} />
         )}
+      </div>
+    </div>
+  );
+}
+
+/* =====================================================================
+   DASHBOARD — team metrics over a selectable time window
+   ===================================================================== */
+const DASHBOARD_PERIODS = [
+  { key: 'hour',  label: 'Last hour',  ms: 60 * 60 * 1000 },
+  { key: 'day',   label: 'Last 24h',   ms: 24 * 60 * 60 * 1000 },
+  { key: 'week',  label: 'Last week',  ms: 7 * 24 * 60 * 60 * 1000 },
+  { key: 'month', label: 'Last month', ms: 30 * 24 * 60 * 60 * 1000 },
+];
+
+function MetricCard({ label, value, sub, tone = 'default' }) {
+  const toneCls = {
+    default: 'text-gray-900',
+    green:   'text-green-700',
+    red:     'text-red-700',
+    blue:    'text-blue-700',
+  }[tone];
+  return (
+    <div className="bg-white rounded-lg border border-gray-200 p-4">
+      <div className="text-xs text-gray-500 mb-1">{label}</div>
+      <div className={classNames('text-3xl font-semibold', toneCls)}>{value}</div>
+      {sub && <div className="text-xs text-gray-600 mt-1">{sub}</div>}
+    </div>
+  );
+}
+
+function DashboardView() {
+  const { state } = useApp();
+  const [period, setPeriod] = useState('week');
+  const [repFilter, setRepFilter] = useState('all');
+
+  const periodMeta = DASHBOARD_PERIODS.find(p => p.key === period) || DASHBOARD_PERIODS[2];
+  const cutoff = useMemo(() => new Date(Date.now() - periodMeta.ms), [period]);
+
+  const accountOwnerById = useMemo(
+    () => Object.fromEntries(state.accounts.map(a => [a.id, a.owner_id])),
+    [state.accounts]
+  );
+
+  const metrics = useMemo(() => {
+    const inPeriod = (ts) => ts && new Date(ts) >= cutoff;
+    const matchRep = (uid) => repFilter === 'all' || repFilter === uid;
+
+    const dials = state.allCalls.filter(c =>
+      c.direction === 'outbound' && inPeriod(c.started_at) && matchRep(c.user_id)
+    ).length;
+
+    const countStage = (stage) => state.stageChanges.filter(sc =>
+      sc.to_stage === stage && inPeriod(sc.changed_at) &&
+      matchRep(sc.changed_by || accountOwnerById[sc.account_id])
+    ).length;
+
+    const meetingsSet = countStage('meeting_set');
+    const discoveryComplete = countStage('discovery_complete');
+    const won = countStage('opportunity_won');
+    const lost = countStage('opportunity_lost');
+    const total = won + lost;
+    const winRate = total > 0 ? Math.round((won / total) * 100) : null;
+
+    return { dials, meetingsSet, discoveryComplete, won, lost, winRate };
+  }, [state.allCalls, state.stageChanges, cutoff, repFilter, accountOwnerById]);
+
+  // Per-rep breakdown (only when "all" is selected)
+  const perRep = useMemo(() => {
+    if (repFilter !== 'all') return null;
+    const rows = state.profiles.map(p => {
+      const inPeriod = (ts) => ts && new Date(ts) >= cutoff;
+      const dials = state.allCalls.filter(c => c.direction === 'outbound' && inPeriod(c.started_at) && c.user_id === p.id).length;
+      const owns = (sc) => (sc.changed_by || accountOwnerById[sc.account_id]) === p.id;
+      const meetingsSet = state.stageChanges.filter(sc => sc.to_stage === 'meeting_set' && inPeriod(sc.changed_at) && owns(sc)).length;
+      const discoveryComplete = state.stageChanges.filter(sc => sc.to_stage === 'discovery_complete' && inPeriod(sc.changed_at) && owns(sc)).length;
+      const won = state.stageChanges.filter(sc => sc.to_stage === 'opportunity_won' && inPeriod(sc.changed_at) && owns(sc)).length;
+      const lost = state.stageChanges.filter(sc => sc.to_stage === 'opportunity_lost' && inPeriod(sc.changed_at) && owns(sc)).length;
+      return { rep: p, dials, meetingsSet, discoveryComplete, won, lost };
+    });
+    return rows
+      .filter(r => r.dials + r.meetingsSet + r.discoveryComplete + r.won + r.lost > 0)
+      .sort((a, b) => b.dials - a.dials);
+  }, [state.profiles, state.allCalls, state.stageChanges, cutoff, repFilter, accountOwnerById]);
+
+  return (
+    <div className="flex flex-1 overflow-hidden">
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <ListTabSwitcher />
+        <div className="px-6 py-5 flex-1 overflow-y-auto scrollbar-thin">
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+            <div className="flex gap-1.5">
+              {DASHBOARD_PERIODS.map(p => (
+                <button key={p.key} onClick={() => setPeriod(p.key)}
+                  className={classNames('px-3 py-1.5 text-sm rounded border',
+                    period === p.key ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50')}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <div className="w-56">
+              <Select value={repFilter} onChange={e => setRepFilter(e.target.value)}
+                options={[{ value: 'all', label: 'All reps' }, ...state.profiles.map(p => ({ value: p.id, label: p.full_name }))]} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <MetricCard label="Dials" value={metrics.dials} tone="blue" />
+            <MetricCard label="Meetings set" value={metrics.meetingsSet} />
+            <MetricCard label="Discovery complete" value={metrics.discoveryComplete} />
+            <MetricCard
+              label="Opportunity won / lost"
+              value={`${metrics.won} W · ${metrics.lost} L`}
+              sub={metrics.winRate != null ? `${metrics.winRate}% win rate` : 'No closed deals in this window'}
+              tone={metrics.winRate != null && metrics.winRate >= 50 ? 'green' : metrics.winRate != null ? 'red' : 'default'}
+            />
+          </div>
+
+          {perRep && perRep.length > 0 && (
+            <div className="mt-6 bg-white border border-gray-200 rounded-lg overflow-hidden">
+              <div className="px-4 py-2 border-b border-gray-200 text-sm font-medium text-gray-700">Per-rep breakdown</div>
+              <table className="min-w-full">
+                <thead className="bg-gray-50">
+                  <tr className="text-left text-xs font-medium text-gray-600">
+                    <th className="px-4 py-2">Rep</th>
+                    <th className="px-4 py-2 text-right">Dials</th>
+                    <th className="px-4 py-2 text-right">Meetings set</th>
+                    <th className="px-4 py-2 text-right">Discovery done</th>
+                    <th className="px-4 py-2 text-right">Won</th>
+                    <th className="px-4 py-2 text-right">Lost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {perRep.map(r => (
+                    <tr key={r.rep.id} className="border-t border-gray-100 text-sm">
+                      <td className="px-4 py-2 text-gray-800">{r.rep.full_name}</td>
+                      <td className="px-4 py-2 text-right text-gray-800">{r.dials}</td>
+                      <td className="px-4 py-2 text-right text-gray-800">{r.meetingsSet}</td>
+                      <td className="px-4 py-2 text-right text-gray-800">{r.discoveryComplete}</td>
+                      <td className="px-4 py-2 text-right text-green-700">{r.won}</td>
+                      <td className="px-4 py-2 text-right text-red-700">{r.lost}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="text-xs text-gray-400 mt-6">
+            Window: {fmtDateTime(cutoff)} → now
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -4404,13 +4562,14 @@ function App() {
     if (!state.user) return;
     (async () => {
       dispatch({ type: 'SET_LOADING', loading: true });
-      const [{ data: profs }, { data: accs }, { data: ctcs }, { data: tsks }, { data: cls }, { data: acts }] = await Promise.all([
+      const [{ data: profs }, { data: accs }, { data: ctcs }, { data: tsks }, { data: cls }, { data: acts }, { data: chs }] = await Promise.all([
         supabase.from('profiles').select('*').order('full_name', { ascending: true }),
         supabase.from('accounts').select('*').neq('status', 'deleted').order('updated_at', { ascending: false }),
         supabase.from('contacts').select('*').order('created_at', { ascending: false }),
         supabase.from('tasks').select('*').order('due_at', { ascending: true, nullsFirst: false }),
         supabase.from('calls').select('*').order('started_at', { ascending: false }).limit(1000),
         supabase.from('activities').select('*').order('occurred_at', { ascending: false }).limit(1000),
+        supabase.from('stage_changes').select('*').order('changed_at', { ascending: false }).limit(2000),
       ]);
       if (profs) dispatch({ type: 'SET_PROFILES', profiles: profs });
       if (accs) dispatch({ type: 'LOAD_ACCOUNTS', accounts: accs });
@@ -4418,6 +4577,7 @@ function App() {
       if (tsks) dispatch({ type: 'SET_ALL_TASKS', tasks: tsks });
       if (cls) dispatch({ type: 'SET_ALL_CALLS', calls: cls });
       if (acts) dispatch({ type: 'SET_ALL_ACTIVITIES', activities: acts });
+      if (chs) dispatch({ type: 'SET_STAGE_CHANGES', changes: chs });
       dispatch({ type: 'SET_LOADING', loading: false });
     })();
   }, [state.user?.id]);
@@ -4529,7 +4689,9 @@ function App() {
                 ? <TaskListView />
                 : state.route.tab === 'activity'
                   ? <ActivityListView />
-                  : <AccountListView />}
+                  : state.route.tab === 'dashboard'
+                    ? <DashboardView />
+                    : <AccountListView />}
       </div>
       {state.modal === 'add_account' && <AddAccountModal />}
       {state.modal === 'add_contact' && <ContactModal />}
