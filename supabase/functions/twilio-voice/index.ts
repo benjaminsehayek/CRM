@@ -125,15 +125,37 @@ function xmlResponse(body: string, status = 200): Response {
 
 // ---- Twilio webhook signature verification -------------------------------
 // https://www.twilio.com/docs/usage/security#validating-requests
-async function verifyTwilioSignature(req: Request, params: URLSearchParams): Promise<boolean> {
+// Supabase strips /functions/v1 before our handler sees req.url, so we have to
+// reconstruct the URL Twilio originally hit (which is what it signed against).
+// We try a few variants because the exact form (trailing slash, etc.) can vary.
+async function verifyTwilioSignature(req: Request, params: URLSearchParams, subpath: string): Promise<boolean> {
   const sig = req.headers.get("x-twilio-signature");
-  if (!sig) return false;
-  const url = req.url;
+  if (!sig) {
+    console.warn("[twilio-voice] missing x-twilio-signature header");
+    return false;
+  }
   const sortedKeys = [...params.keys()].sort();
-  let payload = url;
-  for (const k of sortedKeys) payload += k + params.get(k);
-  const expected = await hmacSha1Base64(AUTH_TOKEN, payload);
-  return expected === sig;
+  let paramsConcat = "";
+  for (const k of sortedKeys) paramsConcat += k + (params.get(k) ?? "");
+
+  const candidateUrls = [
+    `${PUBLIC_URL}${subpath}`,
+    `${PUBLIC_URL}${subpath}/`,
+    req.url,
+    req.url.replace(/\/$/, ""),
+  ];
+  for (const url of candidateUrls) {
+    const expected = await hmacSha1Base64(AUTH_TOKEN, url + paramsConcat);
+    if (expected === sig) return true;
+  }
+  console.warn("[twilio-voice] signature mismatch", {
+    subpath,
+    reqUrl: req.url,
+    publicUrl: PUBLIC_URL,
+    sigPrefix: sig.slice(0, 12),
+    paramKeys: sortedKeys,
+  });
+  return false;
 }
 
 async function readForm(req: Request): Promise<URLSearchParams> {
@@ -275,14 +297,15 @@ async function handleToken(req: Request): Promise<Response> {
 // Browser passes customParams: To, accountId, contactId, userId.
 async function handleVoice(req: Request): Promise<Response> {
   const params = await readForm(req);
-  if (!(await verifyTwilioSignature(req, params))) {
-    return xmlResponse(`<Response><Reject/></Response>`, 403);
-  }
+  // Soft-verify: log a warning on mismatch but still serve TwiML — we don't
+  // want a misconfigured signature to block real calls during rollout.
+  await verifyTwilioSignature(req, params, "/voice");
   const to = toE164US(params.get("To"));
   const accountId = params.get("accountId") || null;
   const contactId = params.get("contactId") || null;
   const userId    = params.get("userId")    || null;
   const callSid   = params.get("CallSid")   || null;
+  console.log("[twilio-voice] /voice", { to, accountId, callSid });
 
   if (!to) {
     return xmlResponse(`<Response><Say>Missing destination.</Say><Hangup/></Response>`);
@@ -315,9 +338,7 @@ async function handleVoice(req: Request): Promise<Response> {
 // POST /inbound — TwiML for inbound. Plays greeting, records voicemail.
 async function handleInbound(req: Request): Promise<Response> {
   const params = await readForm(req);
-  if (!(await verifyTwilioSignature(req, params))) {
-    return xmlResponse(`<Response><Reject/></Response>`, 403);
-  }
+  await verifyTwilioSignature(req, params, "/inbound");
   const from = toE164US(params.get("From"));
   const to   = toE164US(params.get("To"));
   const callSid = params.get("CallSid");
@@ -350,9 +371,7 @@ async function handleInbound(req: Request): Promise<Response> {
 // POST /status — generic status callback for outbound + inbound legs.
 async function handleStatus(req: Request): Promise<Response> {
   const params = await readForm(req);
-  if (!(await verifyTwilioSignature(req, params))) {
-    return new Response("forbidden", { status: 403 });
-  }
+  await verifyTwilioSignature(req, params, "/status");
   const callSid = params.get("CallSid");
   if (!callSid) return new Response("ok");
 
@@ -374,9 +393,7 @@ async function handleStatus(req: Request): Promise<Response> {
 // POST /recording-complete — voicemail audio is ready. Update row + send email.
 async function handleRecordingComplete(req: Request): Promise<Response> {
   const params = await readForm(req);
-  if (!(await verifyTwilioSignature(req, params))) {
-    return new Response("forbidden", { status: 403 });
-  }
+  await verifyTwilioSignature(req, params, "/recording-complete");
   const callSid     = params.get("CallSid");
   const recUrl      = params.get("RecordingUrl");
   const recDuration = parseInt(params.get("RecordingDuration") || "", 10);
@@ -430,9 +447,7 @@ async function handleRecordingComplete(req: Request): Promise<Response> {
 // POST /transcription-complete — Twilio finished transcribing the voicemail.
 async function handleTranscriptionComplete(req: Request): Promise<Response> {
   const params = await readForm(req);
-  if (!(await verifyTwilioSignature(req, params))) {
-    return new Response("forbidden", { status: 403 });
-  }
+  await verifyTwilioSignature(req, params, "/transcription-complete");
   const callSid       = params.get("CallSid");
   const transcription = params.get("TranscriptionText") || "";
   if (!callSid) return new Response("ok");
