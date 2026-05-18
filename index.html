@@ -355,6 +355,1025 @@ const gcal = {
 };
 
 /* =====================================================================
+   CROCS REPORT — auto-generated Local SEO + Site Audit report
+   Ports the standalone Prospect Report Generator pipeline into the CRM,
+   stripping out wizard UI / batch queue / prospect DB. The DataForSEO +
+   Resend send path stays on the existing Cloudflare Worker.
+   ===================================================================== */
+const CROCS_WORKER_URL  = 'https://crocs-clicks-proxy.benjamin-sehayek.workers.dev';
+const CROCS_ADMIN_TOKEN = 'ccadmin2026';
+
+const crocsReport = {
+  // industry → (primary, secondary) keyword templates. Secondary gets the
+  // account's city appended when present. Used when account.report_keywords
+  // is not overridden.
+  INDUSTRY_KW: {
+    auto_body:     { p: 'auto body shop',   s: 'auto body repair' },
+    auto_repair:   { p: 'auto repair',      s: 'mechanic' },
+    paint:         { p: 'house painter',    s: 'painting contractor' },
+    electrical:    { p: 'electrician',      s: 'electrical contractor' },
+    plumbing:      { p: 'plumber',          s: 'emergency plumber' },
+    hvac:          { p: 'hvac',             s: 'heating and cooling' },
+    roofing:       { p: 'roofer',           s: 'roof repair' },
+    remodeling:    { p: 'general contractor', s: 'home remodeling' },
+    landscaping:   { p: 'landscaper',       s: 'landscaping' },
+    janitorial:    { p: 'janitorial services', s: 'commercial cleaning' },
+    flooring:      { p: 'flooring',         s: 'flooring installer' },
+    concrete:      { p: 'concrete contractor', s: 'concrete repair' },
+    fence_deck:    { p: 'fence contractor', s: 'deck builder' },
+    pest_control:  { p: 'pest control',     s: 'exterminator' },
+    pool_spa:      { p: 'pool service',     s: 'pool repair' },
+    garage_door:   { p: 'garage door repair', s: 'garage door installation' },
+    window_door:   { p: 'window installation', s: 'door installation' },
+    solar:         { p: 'solar installer',  s: 'solar panel installation' },
+    tree_service:  { p: 'tree service',     s: 'tree removal' },
+    cleaning:      { p: 'house cleaning',   s: 'cleaning service' },
+    powersports:   { p: 'powersports dealer', s: 'atv repair' },
+    other:         { p: 'local services',   s: 'contractor' },
+  },
+
+  // ─── Worker API helpers ────────────────────────────────────────────────
+  async workerPost(path, body) {
+    const r = await fetch(CROCS_WORKER_URL + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': CROCS_ADMIN_TOKEN },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error('Worker ' + path + ' → ' + r.status);
+    return r.json();
+  },
+  async workerGet(path) {
+    const r = await fetch(CROCS_WORKER_URL + path, {
+      headers: { 'X-Admin-Token': CROCS_ADMIN_TOKEN },
+    });
+    if (!r.ok) throw new Error('Worker ' + path + ' → ' + r.status);
+    return r.json();
+  },
+
+  // ─── Misc helpers ───────────────────────────────────────────────────────
+  esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); },
+  digitsOnly(s) { return (s || '').replace(/\D/g, ''); },
+  sleep(ms) { return new Promise(r => setTimeout(r, ms)); },
+  normalizeCompName(name) {
+    return (name || '').toLowerCase()
+      .replace(/[.,'"!?#@]/g, '')
+      .replace(/\b(inc|llc|co|corp|ltd|limited|company|the|and|dba|pllc|lp)\b/g, '')
+      .replace(/\s+/g, ' ').trim();
+  },
+
+  // ─── Derive keywords from an account ──────────────────────────────────
+  deriveKeywords(account) {
+    if (account.report_keywords && account.report_keywords.trim()) {
+      const overrides = account.report_keywords.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 2);
+      if (overrides.length) return overrides;
+    }
+    const meta = this.INDUSTRY_KW[account.industry] || this.INDUSTRY_KW.other;
+    const city = (account.city || '').trim();
+    const primary   = `${meta.p} near me`;
+    const secondary = city ? `${meta.s} ${city}` : meta.s;
+    return [primary, secondary];
+  },
+
+  // ─── Business lookup (Google Maps via DataForSEO) ─────────────────────
+  async lookupByName(name) {
+    const body = [{ keyword: name, location_name: 'United States', language_code: 'en', device: 'desktop', depth: 10 }];
+    const d = await this.workerPost('/v3/serp/google/maps/live/advanced', body);
+    const items = (d.tasks?.[0]?.result?.[0]?.items || []).filter(i => i.type === 'maps_search');
+    if (!items.length) return [];
+    return items.slice(0, 5).map(i => this.mapItemToResult(i));
+  },
+  async lookupByNameLocated(name, city, state) {
+    const stateMap = { WA: 'Washington,United States', OR: 'Oregon,United States' };
+    const locationName = stateMap[(state || '').toUpperCase()] || 'United States';
+    const keyword = [name, city, state].filter(Boolean).join(' ');
+    const body = [{ keyword, location_name: locationName, language_code: 'en', device: 'desktop', depth: 10 }];
+    const d = await this.workerPost('/v3/serp/google/maps/live/advanced', body);
+    const items = (d.tasks?.[0]?.result?.[0]?.items || []).filter(i => i.type === 'maps_search');
+    if (!items.length) return [];
+    return items.slice(0, 5).map(i => this.mapItemToResult(i));
+  },
+  async lookupByDomain(input) {
+    const domain = input.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+    const d = await this.workerPost('/v3/business_data/business_listings/search/live', [{
+      categories: [], filters: [['domain', '=', domain]], language_code: 'en', limit: 5,
+    }]);
+    const items = d.tasks?.[0]?.result?.[0]?.items || [];
+    return items.map(i => this.listingToResult(i));
+  },
+  mapItemToResult(item) {
+    const ap = (item.address || '').split(',').map(s => s.trim());
+    return {
+      name: item.title || '',
+      address: ap[0] || item.address || '',
+      city: ap[1] || '',
+      state: ap[2]?.split(' ')[0] || '',
+      latitude: item.gps_coordinates?.latitude || item.latitude || 0,
+      longitude: item.gps_coordinates?.longitude || item.longitude || 0,
+      phone: item.phone || null,
+      website: item.url || null,
+      placeId: item.place_id || null,
+      cid: item.cid || null,
+      category: item.category || null,
+    };
+  },
+  listingToResult(item) {
+    return {
+      name: item.title || '',
+      address: item.address || '',
+      city: item.address_info?.city || '',
+      state: item.address_info?.region || '',
+      latitude: item.latitude || 0,
+      longitude: item.longitude || 0,
+      phone: item.phone || null,
+      website: item.url || (item.domain ? `https://${item.domain}` : null),
+      placeId: item.place_id || null,
+      cid: item.cid || null,
+      category: item.category || null,
+    };
+  },
+
+  // ─── Resolve a business location for an account (cache on the row) ────
+  async resolveBusinessLocation(account, dispatch) {
+    if (account.gbp_lat && account.gbp_lng) {
+      return {
+        name: account.name,
+        latitude: parseFloat(account.gbp_lat),
+        longitude: parseFloat(account.gbp_lng),
+        cid: account.gbp_cid || null,
+        placeId: account.gbp_place_id || null,
+        website: account.website || null,
+        city: account.city || '', state: account.state || '',
+        address: account.street || '',
+      };
+    }
+    // First-time lookup: try domain → name+located → name
+    let candidate = null;
+    if (account.website) {
+      try {
+        const r = await this.lookupByDomain(account.website);
+        if (r.length) candidate = r[0];
+      } catch {}
+    }
+    if (!candidate) {
+      try {
+        const r = await this.lookupByNameLocated(account.name, account.city, account.state);
+        if (r.length) candidate = r[0];
+      } catch {}
+    }
+    if (!candidate) {
+      try {
+        const r = await this.lookupByName(account.name);
+        if (r.length) candidate = r[0];
+      } catch {}
+    }
+    if (!candidate || !candidate.latitude || !candidate.longitude) {
+      throw new Error('Could not locate business on Google Maps');
+    }
+    // Persist to the account
+    const patch = {
+      gbp_lat: candidate.latitude,
+      gbp_lng: candidate.longitude,
+      gbp_cid: candidate.cid,
+      gbp_place_id: candidate.placeId,
+    };
+    const { data } = await supabase.from('accounts').update(patch).eq('id', account.id).select().single();
+    if (data && dispatch) dispatch({ type: 'UPSERT_ACCOUNT', account: data });
+    return candidate;
+  },
+
+  // ─── Reverse geocode → neighborhood label (Nominatim, free) ───────────
+  async reverseGeocode(lat, lon) {
+    const zooms = [16, 15, 14];
+    for (const zoom of zooms) {
+      try {
+        const r = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&zoom=${zoom}&addressdetails=1`,
+          { headers: { 'User-Agent': 'CrocsAndClicksCRM/1.0' } });
+        if (!r.ok) continue;
+        const d = await r.json();
+        const a = d.address || {};
+        const name = a.neighbourhood || a.suburb || a.city_district || a.quarter
+                  || a.hamlet || a.village || a.town || a.city || '';
+        if (name && name !== (a.county || '') && name !== (a.state || '')) return name;
+        if (name && zoom < 16) return name;
+      } catch {}
+      if (zoom > 14) await this.sleep(300);
+    }
+    return '';
+  },
+  async getHoodLabels(pts, sz) {
+    const mid = Math.floor(sz / 2);
+    const edges = [
+      { key: 'n', idx: mid },
+      { key: 's', idx: (sz - 1) * sz + mid },
+      { key: 'w', idx: mid * sz },
+      { key: 'e', idx: mid * sz + (sz - 1) },
+    ];
+    const labels = { n: '', s: '', w: '', e: '' };
+    for (const { key, idx } of edges) {
+      const pt = pts[idx];
+      if (pt && pt.lat && pt.lng) {
+        labels[key] = await this.reverseGeocode(pt.lat, pt.lng);
+        await this.sleep(1200);
+      }
+    }
+    return labels;
+  },
+
+  // ─── Grid generation ──────────────────────────────────────────────────
+  genGrid(lat, lng, mi, sz) {
+    const pts = [], km = mi * 1.60934, step = km * 2 / (sz - 1), R = 6371;
+    for (let i = 0; i < sz; i++) for (let j = 0; j < sz; j++) {
+      const x = -km + j * step, y = km - i * step;
+      pts.push({
+        lat: lat + y / R * 180 / Math.PI,
+        lng: lng + x / R * 180 / Math.PI / Math.cos(lat * Math.PI / 180),
+        ctr: i === Math.floor(sz / 2) && j === Math.floor(sz / 2),
+        rk: {},
+      });
+    }
+    return pts;
+  },
+
+  // ─── Grid scan (5×5 × 2 keywords, 20-way concurrency) ────────────────
+  async runGridScan(biz, kws, rad) {
+    const SZ = 5;
+    const primaryKw    = kws[0];
+    const secondaryKws = kws[1] ? [kws[1]] : [];
+    const lat = biz.latitude, lng = biz.longitude;
+    const primaryPts   = this.genGrid(lat, lng, rad, SZ);
+    const secondaryPts = this.genGrid(lat, lng, rad, SZ);
+    const initPt = (pt) => {
+      pt.rk = {}; pt.comps = {};
+      [primaryKw, ...secondaryKws].forEach(k => { pt.rk[k] = null; });
+    };
+    primaryPts.forEach(initPt);
+    secondaryPts.forEach(initPt);
+
+    const bizNormalized = this.normalizeCompName(biz.name);
+    const bl = biz.name.toLowerCase().trim();
+    const compsByKw = {};
+    [primaryKw, ...secondaryKws].forEach(k => compsByKw[k] = {});
+
+    const tasks = [];
+    primaryPts.forEach(pt => tasks.push({ pt, kw: primaryKw }));
+    secondaryPts.forEach(pt => secondaryKws.forEach(kw => tasks.push({ pt, kw })));
+
+    const processTask = async ({ pt, kw }) => {
+      try {
+        const d = await this.workerPost('/v3/serp/google/maps/live/advanced', [{
+          keyword: kw,
+          location_coordinate: `${pt.lat.toFixed(7)},${pt.lng.toFixed(7)},11z`,
+          language_code: 'en', device: 'desktop', depth: 10, search_places: false,
+        }]);
+        if (d.status_code !== 20000 || d.tasks?.[0]?.status_code !== 20000) { pt.rk[kw] = null; return; }
+        const items = (d.tasks?.[0]?.result?.[0]?.items || []).filter(i => i.type === 'maps_search');
+        let rank = null; const comps = [];
+        for (const it of items) {
+          if (!it.title || !it.title.trim() || !it.rank_group || it.rank_group < 1) continue;
+          const title = it.title.toLowerCase().trim();
+          const norm  = this.normalizeCompName(it.title);
+          const isBiz = norm === bizNormalized
+            || (biz.cid && it.cid && String(it.cid) === String(biz.cid))
+            || title === bl;
+          if (rank === null && isBiz) rank = it.rank_group;
+          if (isBiz) continue;
+          comps.push({ name: it.title.trim(), norm, rank: it.rank_group });
+        }
+        pt.rk[kw] = rank;
+        pt.comps = pt.comps || {};
+        pt.comps[kw] = comps;
+        comps.forEach(c => {
+          if (!compsByKw[kw][c.norm]) compsByKw[kw][c.norm] = { n: c.name, norm: c.norm, sum: 0, cnt: 0 };
+          else if (c.name.length > compsByKw[kw][c.norm].n.length) compsByKw[kw][c.norm].n = c.name;
+          compsByKw[kw][c.norm].sum += c.rank;
+          compsByKw[kw][c.norm].cnt++;
+        });
+      } catch {
+        pt.rk[kw] = null;
+      }
+    };
+
+    const SCAN_TIMEOUT_MS = 3 * 60 * 1000;
+    const deadline = Date.now() + SCAN_TIMEOUT_MS;
+    let idx = 0, timedOut = false;
+    const worker = async () => {
+      while (idx < tasks.length) {
+        if (Date.now() > deadline) { timedOut = true; break; }
+        await processTask(tasks[idx++]);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(20, tasks.length) }, worker));
+
+    const topCompsByKw = {};
+    [primaryKw, ...secondaryKws].forEach(k => {
+      topCompsByKw[k] = Object.values(compsByKw[k])
+        .filter(c => c.cnt >= 1)
+        .map(c => ({ ...c, avg: c.sum / c.cnt, score: c.cnt * (21 - Math.min(c.sum / c.cnt, 20)) }))
+        .sort((a, b) => b.score - a.score || a.avg - b.avg)
+        .slice(0, 5);
+    });
+
+    let hoodLabels = { n: '', s: '', w: '', e: '' };
+    try { hoodLabels = await this.getHoodLabels(primaryPts, SZ); } catch {}
+
+    return {
+      ts: Date.now(),
+      biz: biz.name, addr: biz.address || '',
+      lat, lng, rad,
+      kws: [primaryKw, ...secondaryKws],
+      hoodLabels,
+      pts: primaryPts,
+      ptsSec: secondaryPts,
+      sz: SZ, szSec: SZ,
+      compsByKw: topCompsByKw,
+      scanTimedOut: timedOut,
+    };
+  },
+
+  // ─── Site audit ───────────────────────────────────────────────────────
+  async runSiteAudit(domain) {
+    if (!domain) return null;
+    try {
+      const taskBody = [{
+        target: domain, max_crawl_pages: 20, load_resources: true,
+        enable_javascript: false, enable_browser_rendering: false,
+        switch_pool: true, support_cookies: true,
+      }];
+      const taskResp = await this.workerPost('/v3/on_page/task_post', taskBody);
+      if (taskResp.status_code !== 20000) throw new Error('Crawl task failed: ' + taskResp.status_message);
+      const taskId = taskResp.tasks?.[0]?.id;
+      if (!taskId) throw new Error('No task ID');
+
+      let attempts = 0, pollInterval = 2000;
+      const maxAttempts = 60;
+      while (attempts < maxAttempts) {
+        await this.sleep(pollInterval);
+        attempts++;
+        if (attempts === 8)  pollInterval = 4000;
+        if (attempts === 18) pollInterval = 8000;
+        try {
+          const summResp = await fetch(CROCS_WORKER_URL + '/v3/on_page/summary/' + taskId, {
+            headers: { 'X-Admin-Token': CROCS_ADMIN_TOKEN },
+          });
+          const summData = await summResp.json();
+          if (summData.status_code !== 20000) break;
+          const result = summData.tasks?.[0]?.result?.[0];
+          if (!result) continue;
+          const crawled = result.crawl_status?.pages_crawled || 0;
+          const queued  = result.crawl_status?.pages_in_queue || 0;
+          if (result.crawl_progress === 'finished') break;
+          if (attempts >= 10 && crawled === 0 && queued === 0) break;
+        } catch {}
+      }
+
+      const [finalSumm, pagesResp] = await Promise.all([
+        fetch(CROCS_WORKER_URL + '/v3/on_page/summary/' + taskId, {
+          headers: { 'X-Admin-Token': CROCS_ADMIN_TOKEN },
+        }).then(r => r.json()),
+        this.workerPost('/v3/on_page/pages', [{ id: taskId, limit: 60, filters: [['resource_type', '=', 'html']] }]),
+      ]);
+
+      const summResult  = finalSumm.tasks?.[0]?.result?.[0] || {};
+      const pagesResult = pagesResp.tasks?.[0]?.result?.[0]?.items || [];
+      let criticalIssues = 0, warnings = 0, notices = 0;
+      const issueTypes = {};
+      pagesResult.forEach(page => {
+        const checks = page.checks || {};
+        Object.entries(checks).forEach(([key, val]) => {
+          if (val === true) {
+            if (!issueTypes[key]) issueTypes[key] = 0;
+            issueTypes[key]++;
+            const critical = ['is_broken','has_redirect_chain','is_4xx_code','is_5xx_code','has_duplicate_title','has_duplicate_description','has_no_title','has_no_description','has_no_h1_tags','has_no_content_encoding','is_http','is_https_redirect_invalid','has_no_canonical'];
+            const warning  = ['has_duplicate_meta_tags','has_flash','has_frames','has_deprecated_tags','has_no_image_alt','has_multiple_h1_tags','has_low_content_rate','has_no_micromarkup','has_no_og_tags'];
+            if (critical.includes(key)) criticalIssues++;
+            else if (warning.includes(key)) warnings++;
+            else notices++;
+          }
+        });
+      });
+      const topIssuesFull = Object.entries(issueTypes).map(([k,v]) => ({ key: k, count: v }))
+        .sort((a,b) => b.count - a.count).slice(0, 12);
+
+      const totalPages    = summResult.crawl_status?.pages_crawled || pagesResult.length;
+      const onpageSummary = summResult.page_metrics || {};
+      const broken        = (onpageSummary.broken_resources || 0) + (onpageSummary.broken_links || 0);
+      const crawlBlocked  = totalPages === 0 || (totalPages <= 1 && criticalIssues === 0 && warnings === 0 && notices === 0);
+      const crawlTimedOut = attempts >= maxAttempts;
+      const issueRatio    = (criticalIssues + warnings * 0.5) / Math.max(1, totalPages);
+      const healthScore   = crawlBlocked ? null : Math.max(10, Math.round(100 - Math.min(90, issueRatio * 60)));
+      const httpPages     = pagesResult.filter(p => p.url && p.url.startsWith('http://')).length;
+      const hasSSL        = pagesResult.length === 0 ? null : httpPages === 0;
+      const noindexPages  = pagesResult.filter(p => {
+        const m = p.meta || {};
+        return m.robots_info && (m.robots_info.noindex === true || (typeof m.robots_info === 'string' && m.robots_info.includes('noindex')));
+      }).length;
+      const missingCanonical = issueTypes['has_no_canonical'] || 0;
+      const thinContent      = pagesResult.filter(p => {
+        const wc = p.meta?.content?.plain_text_word_count || p.meta?.content?.words_count || 0;
+        return wc > 10 && wc < 100;
+      }).length;
+      const missingSchema = issueTypes['has_no_micromarkup'] || 0;
+      const missingOG     = issueTypes['has_no_og_tags']     || 0;
+      const mixedContent  = issueTypes['has_mixed_content']  || 0;
+
+      let hasSitemap = null, hasRobots = null;
+      try {
+        const [sm, rb] = await Promise.all([
+          fetch(`${CROCS_WORKER_URL}/probe?url=https://${domain}/sitemap.xml`, { headers: { 'X-Admin-Token': CROCS_ADMIN_TOKEN } }).then(r => r.json()).catch(() => ({ ok: null })),
+          fetch(`${CROCS_WORKER_URL}/probe?url=https://${domain}/robots.txt`,  { headers: { 'X-Admin-Token': CROCS_ADMIN_TOKEN } }).then(r => r.json()).catch(() => ({ ok: null })),
+        ]);
+        hasSitemap = sm.ok === true ? true : sm.ok === false ? false : null;
+        hasRobots  = rb.ok === true ? true : rb.ok === false ? false : null;
+      } catch {}
+
+      return {
+        domain, totalPages, crawled: totalPages,
+        criticalIssues, warnings, notices, broken, healthScore,
+        topIssues: topIssuesFull, onpageSummary,
+        crawlBlocked, crawlTimedOut,
+        hasSSL, httpPages, noindexPages, missingCanonical, thinContent,
+        missingSchema, missingOG, hasSitemap, hasRobots, mixedContent,
+      };
+    } catch (e) {
+      console.error('[report] audit failed:', e.message);
+      return null;
+    }
+  },
+
+  // ─── Audit category scoring (5-category weighted overall) ─────────────
+  computeAuditScores(audit) {
+    if (!audit) return null;
+    if (audit.crawlBlocked) return { blocked: true, seoScore: null, techScore: null, contentScore: null, linkScore: null, localSeoScore: null, overallScore: null };
+    const imap = {};
+    (audit.topIssues || []).forEach(i => { imap[i.key] = i.count; });
+    const total = Math.max(1, audit.totalPages);
+
+    const seoRaw = (imap['has_no_title'] || 0) * 1.5
+      + (imap['has_no_description'] || 0) * 1.2
+      + (imap['has_no_h1_tags'] || 0) * 1.0
+      + (imap['has_duplicate_title'] || 0) * 0.6
+      + (imap['has_duplicate_description'] || 0) * 0.4
+      + (imap['has_no_canonical'] || 0) * 0.8
+      + (imap['has_no_micromarkup'] || 0) * 0.3
+      + (imap['has_no_og_tags'] || 0) * 0.2;
+    const seoScore = Math.max(5, Math.round(100 - Math.min(95, (seoRaw / total) * 90)));
+
+    const techRaw = (imap['is_broken'] || 0) * 2.5
+      + (imap['is_4xx_code'] || 0) * 2.0
+      + (imap['is_5xx_code'] || 0) * 3.0
+      + (imap['has_redirect_chain'] || 0) * 1.2
+      + (imap['has_no_content_encoding'] || 0) * 0.4
+      + (imap['has_mixed_content'] || 0) * 1.5
+      + (imap['is_http'] || 0) * 2.0
+      + (audit.broken || 0) * 0.5
+      + (audit.hasSSL === false ? total * 0.5 : 0)
+      + (audit.hasSitemap === false && (audit.totalPages || 0) > 3 ? 5 : 0)
+      + (audit.hasRobots === false ? 3 : 0);
+    const techScore = Math.max(5, Math.round(100 - Math.min(95, (techRaw / total) * 75)));
+
+    const contentRaw = (imap['has_no_h1_tags'] || 0) * 1.2
+      + (imap['has_multiple_h1_tags'] || 0) * 0.8
+      + (imap['has_no_description'] || 0) * 0.5
+      + (audit.thinContent || 0) * 0.9
+      + (audit.noindexPages || 0) * 0.4;
+    const contentScore = Math.max(5, Math.round(100 - Math.min(95, (contentRaw / total) * 70)));
+
+    const linkRaw = (imap['has_no_image_alt'] || 0) * 0.6
+      + (audit.broken || 0) * 0.8
+      + (imap['has_mixed_content'] || 0) * 0.5;
+    const linkScore = Math.max(5, Math.round(100 - Math.min(95, (linkRaw / total) * 60)));
+
+    const localSeoRaw = (audit.missingSchema || 0) * 1.2
+      + (audit.missingOG || 0) * 0.5
+      + (audit.hasSitemap === false && (audit.totalPages || 0) > 3 ? 10 : 0)
+      + (audit.hasRobots === false ? 5 : 0);
+    const localSeoScore = Math.max(5, Math.round(100 - Math.min(95, (localSeoRaw / total) * 80)));
+
+    const overallScore = Math.round(
+      seoScore     * 0.25 +
+      techScore    * 0.25 +
+      contentScore * 0.20 +
+      linkScore    * 0.15 +
+      localSeoScore * 0.15
+    );
+
+    return { seoScore, techScore, contentScore, linkScore, localSeoScore, overallScore };
+  },
+};
+
+/* =====================================================================
+   CROCS REPORT — HTML builders + orchestrator
+   Ported verbatim from the standalone Prospect Report Generator
+   (buildGridSectionsHTML + buildFullEmailHTML) so the auto-sent cadence
+   email is byte-identical to what the rep would produce manually.
+   ===================================================================== */
+function buildReportGridSections(sd) {
+  const eH = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const pts    = sd.pts    || [];
+  const ptsSec = sd.ptsSec || sd.pts || [];
+  const kws    = sd.kws    || [];
+  const sz     = sd.sz     || 5;
+  const szSec  = sd.szSec  || 5;
+
+  function rankColor(r) { if (r === null) return '#9ca3af'; if (r <= 3) return '#22c55e'; if (r <= 7) return '#84cc16'; if (r <= 10) return '#f59e0b'; if (r <= 20) return '#ef4444'; return '#7c3aed'; }
+  function rankBg(r)    { if (r === null) return '#f3f4f6'; if (r <= 3) return '#dcfce7'; if (r <= 7) return '#ecfccb'; if (r <= 10) return '#fef9c3'; if (r <= 20) return '#fee2e2'; return '#e6f7f6'; }
+  function getZone(i, sz, hl) {
+    if (hl && (hl.n || hl.s || hl.w || hl.e)) {
+      const row = Math.floor(i / sz), col = i % sz, mid = Math.floor(sz / 2);
+      if (row === mid && col === mid) return hl.n || hl.s || hl.w || hl.e || 'Center';
+      const dN = row, dS = sz - 1 - row, dW = col, dE = sz - 1 - col;
+      const minD = Math.min(dN, dS, dW, dE);
+      if (minD === dN && hl.n) return hl.n;
+      if (minD === dS && hl.s) return hl.s;
+      if (minD === dW && hl.w) return hl.w;
+      if (minD === dE && hl.e) return hl.e;
+      if (row < mid && col < mid) return hl.w || hl.n || '';
+      if (row < mid && col > mid) return hl.e || hl.n || '';
+      if (row > mid && col < mid) return hl.w || hl.s || '';
+      return hl.e || hl.s || '';
+    }
+    const row = Math.floor(i / sz), col = i % sz, mid = Math.floor(sz / 2);
+    const rl = row < mid ? 'North' : row > mid ? 'South' : 'Central';
+    const cl = col < mid ? 'West'  : col > mid ? 'East'  : '';
+    if (row === mid && col === mid) return 'Center';
+    return (rl + (cl ? ' ' + cl : '')).trim();
+  }
+  function gradeLabel(vis, top3Pct) {
+    if (vis >= 0.7 && top3Pct >= 0.4) return { g: 'Strong',   c: '#F06478', bg: '#FAE8E0' };
+    if (vis >= 0.4)                   return { g: 'Moderate', c: '#f59e0b', bg: '#fef9c3' };
+    return                                   { g: 'Limited',  c: '#ef4444', bg: '#fee2e2' };
+  }
+  function miniGrid(ptsArr, kw, sz, cs) {
+    cs = cs || 48;
+    let g = '<table cellpadding="0" cellspacing="0" style="margin:0 auto;border-collapse:separate;border-spacing:4px;"><tr>';
+    ptsArr.forEach((pt, i) => {
+      if (i > 0 && i % sz === 0) g += '</tr><tr>';
+      const r   = pt.rk && pt.rk[kw] !== undefined ? pt.rk[kw] : null;
+      const bg  = rankBg(r);
+      const clr = rankColor(r);
+      const borderStyle = pt.ctr ? '3px solid #F06478' : '2px solid ' + clr;
+      const rankTxt = r === null ? '&mdash;' : '#' + r;
+      const inner = pt.ctr
+        ? '<div style="font-size:8px;font-weight:800;color:#F06478;line-height:1;margin-bottom:2px;letter-spacing:.02em;">&#9733; YOU</div><div style="font-size:13px;font-weight:900;color:' + clr + ';line-height:1;">' + rankTxt + '</div>'
+        : '<div style="font-size:14px;font-weight:900;color:' + clr + ';line-height:1;">' + rankTxt + '</div>';
+      g += '<td style="width:' + cs + 'px;height:' + cs + 'px;background:' + bg + ';border:' + borderStyle + ';border-radius:10px;text-align:center;vertical-align:middle;">' + inner + '</td>';
+    });
+    g += '</tr></table>';
+    return g;
+  }
+  function kwStats(kw) {
+    const kwIdx = kws.indexOf(kw);
+    const arr = kwIdx > 0 ? ptsSec : pts;
+    const sizeA = kwIdx > 0 ? szSec : sz;
+    const ranks = arr.map(p => p.rk[kw]).filter(r => r !== null);
+    const top3 = ranks.filter(r => r <= 3).length;
+    const found = ranks.length, total = arr.length, invisible = total - found;
+    const avg = ranks.length ? ranks.reduce((a, b) => a + b, 0) / ranks.length : null;
+    const mid = Math.floor(sizeA / 2);
+    const innerR = [], outerR = [];
+    arr.forEach((pt, i) => {
+      const row = Math.floor(i / sizeA), col = i % sizeA;
+      if (Math.abs(row - mid) <= 1 && Math.abs(col - mid) <= 1 && pt.rk[kw] !== null) innerR.push(pt.rk[kw]);
+      if ((Math.abs(row - mid) > 1 || Math.abs(col - mid) > 1) && pt.rk[kw] !== null) outerR.push(pt.rk[kw]);
+    });
+    const weakZones = [], strongZones = [], seen = {};
+    arr.forEach((pt, i) => {
+      const r = pt.rk[kw], z = getZone(i, sizeA, sd.hoodLabels);
+      if (!seen[z]) { seen[z] = true; if (r !== null && r <= 3) strongZones.push(z); else if (r === null || r > 10) weakZones.push(z); }
+    });
+    return {
+      ranks, top3, found, total, invisible, avg,
+      vis: found / total, top3Pct: top3 / total,
+      weakZones, strongZones,
+      innerAvg: innerR.length ? innerR.reduce((a, b) => a + b) / innerR.length : null,
+      outerAvg: outerR.length ? outerR.reduce((a, b) => a + b) / outerR.length : null,
+    };
+  }
+
+  const allStats     = kws.map(kw => ({ kw, s: kwStats(kw) }));
+  const totalAreas   = pts.length;
+  const overallFound = Math.round(allStats.reduce((a, x) => a + x.s.found, 0) / kws.length);
+  const overallTop3  = Math.round(allStats.reduce((a, x) => a + x.s.top3,  0) / kws.length);
+  const visStats     = allStats.filter(x => x.s.avg !== null);
+  const overallAvg   = visStats.length ? visStats.reduce((a, x) => a + x.s.avg, 0) / visStats.length : null;
+  const overallGrade = gradeLabel(overallFound / totalAreas, overallTop3 / totalAreas);
+
+  // EXEC SUMMARY (lite — full one is in buildReportEmail)
+  let execSummary = '';
+
+  // KW SECTION
+  let kwSection = '';
+  kws.forEach(kw => {
+    const s = kwStats(kw);
+    const gl = gradeLabel(s.vis, s.top3Pct);
+    const gradeIcon = gl.g === 'Strong' ? '&#9650;' : gl.g === 'Moderate' ? '&#9670;' : '&#9660;';
+    const isSecondary = kws.indexOf(kw) > 0;
+    const kwPts  = isSecondary ? ptsSec : pts;
+    const kwSz   = isSecondary ? szSec  : sz;
+    const visPct = Math.round(s.vis * 100);
+    const visBarColor = '#F06478';
+
+    kwSection += '<tr><td style="background:#FAF7F4;padding:14px 28px 18px;">';
+    kwSection += '<div style="background:#FDF5F2;border:1px solid #EDD8D0;border-left:4px solid ' + gl.c + ';border-radius:0 12px 12px 0;padding:18px 20px;">';
+    kwSection += '<div style="margin-bottom:16px;">';
+    kwSection += '<div style="font-size:16px;font-weight:900;color:#1a1a2e;margin-bottom:8px;">' + eH(kw) + '</div>';
+    kwSection += '<table cellpadding="0" cellspacing="0"><tr>';
+    kwSection += '<td style="vertical-align:middle;padding-right:10px;">';
+    kwSection += '<span style="display:inline-block;background:' + gl.bg + ';color:' + gl.c + ';font-size:10px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;padding:3px 10px;border-radius:20px;">' + gradeIcon + ' ' + gl.g + '</span>';
+    kwSection += '</td>';
+    kwSection += '<td style="vertical-align:middle;font-size:11px;color:#9ca3af;">';
+    kwSection += s.found + ' of ' + s.total + ' areas visible &nbsp;·&nbsp; ' + s.top3 + ' in top 3';
+    if (s.avg) kwSection += ' &nbsp;·&nbsp; avg #' + s.avg.toFixed(1);
+    kwSection += '</td></tr></table>';
+    kwSection += '</div>';
+
+    const statCards = [
+      { val: s.top3, label: 'Top 3', color: '#F06478' },
+      { val: visPct + '%', label: 'Visible', color: '#F06478' },
+      { val: s.avg ? '#' + s.avg.toFixed(1) : '—', label: 'Avg rank', color: '#6b7280' },
+      { val: s.invisible, label: 'Invisible', color: s.invisible > s.total / 2 ? '#ef4444' : '#f59e0b' },
+    ];
+    kwSection += '<table cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:16px;border-collapse:separate;border-spacing:8px 0;"><tr>';
+    statCards.forEach(sc => {
+      kwSection += '<td width="25%" style="background:#ffffff;border:1px solid #EDD8D0;border-radius:10px;padding:10px 8px;text-align:center;vertical-align:middle;">';
+      kwSection += '<div style="font-size:20px;font-weight:900;color:' + sc.color + ';line-height:1;margin-bottom:4px;">' + sc.val + '</div>';
+      kwSection += '<div style="font-size:9px;color:#9ca3af;text-transform:uppercase;letter-spacing:.05em;font-weight:700;">' + sc.label + '</div>';
+      kwSection += '</td>';
+    });
+    kwSection += '</tr></table>';
+
+    kwSection += '<table cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:16px;">';
+    kwSection += '<tr><td style="font-size:11px;color:#6b7280;padding-bottom:5px;">Visibility across ' + sd.rad + '-mile service area</td>';
+    kwSection += '<td style="font-size:11px;font-weight:800;color:#1a1a2e;text-align:right;padding-bottom:5px;">' + visPct + '% visible</td></tr>';
+    kwSection += '<tr><td colspan="2" style="padding:0;">';
+    kwSection += '<table cellpadding="0" cellspacing="0" width="100%" style="background:#EDD8D0;border-radius:4px;height:8px;"><tr>';
+    kwSection += '<td width="' + visPct + '%" style="background:' + visBarColor + ';border-radius:4px;height:8px;"></td>';
+    kwSection += '<td></td></tr></table>';
+    kwSection += '</td></tr></table>';
+
+    const hl = sd.hoodLabels || {};
+    const labelStyle = 'font-size:10px;font-weight:800;color:#8B6070;letter-spacing:.04em;text-align:center;padding:4px 0;';
+    const sideStyle  = 'font-size:10px;font-weight:800;color:#8B6070;writing-mode:vertical-rl;';
+    kwSection += '<table cellpadding="0" cellspacing="0" style="margin:0 auto 14px;">';
+    if (hl.n) kwSection += '<tr><td></td><td style="' + labelStyle + '">' + eH(hl.n) + '</td><td></td></tr>';
+    kwSection += '<tr>';
+    if (hl.w) kwSection += '<td style="padding-right:6px;"><div style="' + sideStyle + 'transform:rotate(180deg);">' + eH(hl.w) + '</div></td>';
+    else kwSection += '<td></td>';
+    kwSection += '<td>' + miniGrid(kwPts, kw, kwSz, 48) + '</td>';
+    if (hl.e) kwSection += '<td style="padding-left:6px;"><div style="' + sideStyle + '">' + eH(hl.e) + '</div></td>';
+    else kwSection += '<td></td>';
+    kwSection += '</tr>';
+    if (hl.s) kwSection += '<tr><td></td><td style="' + labelStyle + '">' + eH(hl.s) + '</td><td></td></tr>';
+    kwSection += '</table>';
+
+    const legendItems = [
+      { bg:'#dcfce7', border:'#22c55e', label:'#1–3' },
+      { bg:'#ecfccb', border:'#84cc16', label:'#4–7' },
+      { bg:'#fef9c3', border:'#f59e0b', label:'#8–10' },
+      { bg:'#fee2e2', border:'#ef4444', label:'#11–20' },
+      { bg:'#f3f4f6', border:'#d1d5db', label:'Not found' },
+      { bg:'#f3f4f6', border:'#F06478', label:'Your location', borderW:'2px' },
+    ];
+    kwSection += '<table cellpadding="0" cellspacing="0" style="margin:0 auto 14px;"><tr>';
+    legendItems.forEach(li => {
+      kwSection += '<td style="padding:0 7px;text-align:center;white-space:nowrap;">';
+      kwSection += '<table cellpadding="0" cellspacing="0" style="display:inline-table;"><tr>';
+      kwSection += '<td style="width:10px;height:10px;background:' + li.bg + ';border:' + (li.borderW || '1.5px') + ' solid ' + li.border + ';border-radius:2px;vertical-align:middle;"></td>';
+      kwSection += '<td style="font-size:10px;color:#6b7280;font-weight:600;padding-left:4px;vertical-align:middle;">' + li.label + '</td>';
+      kwSection += '</tr></table></td>';
+    });
+    kwSection += '</tr></table>';
+
+    if (s.weakZones.length > 0) {
+      kwSection += '<div style="background:#FAE8E0;border-left:3px solid #F06478;border-radius:0 8px 8px 0;padding:10px 14px;font-size:11px;color:#374151;">';
+      kwSection += '<strong style="color:#D94060;">Weak zones:</strong> ' + s.weakZones.join(', ') + '. These are the areas that need the most work.';
+      kwSection += '</div>';
+    }
+    kwSection += '</div></td></tr>';
+  });
+
+  // COMPETITORS
+  let compSection = '<tr><td style="background:#FAF7F4;padding:14px 28px 18px;">';
+  const primaryKw = kws[0];
+  const topComps = (sd.compsByKw && sd.compsByKw[primaryKw]) || [];
+  if (!topComps.length) {
+    compSection += '<div style="text-align:center;padding:24px;color:#6b7280;font-size:13px;background:#fafafa;border:1px solid #e8e8e8;border-radius:12px;">No competitor data available — Google Maps returned limited results for this keyword.</div>';
+  }
+  topComps.slice(0, 3).forEach((comp, ci) => {
+    const compPts = pts.map(pt => {
+      const rawComps = pt.comps && pt.comps[primaryKw];
+      let rank = null;
+      if (Array.isArray(rawComps)) {
+        const f = rawComps.find(c => c.norm === comp.norm);
+        rank = f ? f.rank : null;
+      } else if (rawComps && typeof rawComps === 'object') {
+        rank = rawComps[comp.norm] !== undefined ? rawComps[comp.norm] : null;
+      }
+      return { rk: { [primaryKw]: rank }, ctr: false };
+    });
+    const compRanks = compPts.map(p => p.rk[primaryKw]).filter(r => r !== null);
+    const compTop3   = compRanks.filter(r => r <= 3).length;
+    const compVisible = compRanks.length;
+    const compAvg = compRanks.length ? (compRanks.reduce((a, b) => a + b) / compRanks.length).toFixed(1) : comp.avg.toFixed(1);
+    const compVisRatio = compVisible / pts.length, compTop3Ratio = compTop3 / pts.length;
+    const compGrade = compVisRatio >= 0.7 && compTop3Ratio >= 0.4
+      ? { g: 'Strong', c: '#22c55e', bg: '#dcfce7' }
+      : compVisRatio >= 0.4 ? { g: 'Moderate', c: '#f59e0b', bg: '#fef9c3' }
+      : { g: 'Limited', c: '#ef4444', bg: '#fee2e2' };
+
+    compSection += '<div style="background:#ffffff;border:1px solid #e8e8e8;border-radius:12px;padding:16px;margin-bottom:12px;">';
+    compSection += '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;"><div>';
+    compSection += '<div style="font-size:13px;font-weight:800;color:#1a1a2e;">' + (ci + 1) + '. ' + eH(comp.n) + '</div>';
+    compSection += '<div style="font-size:11px;color:#6b7280;margin-top:3px;">Visible in <strong>' + compVisible + '</strong> of ' + pts.length + ' areas &middot; Top 3 in <strong>' + compTop3 + '</strong> &middot; Avg rank <strong>#' + compAvg + '</strong></div>';
+    compSection += '</div>';
+    compSection += '<span style="background:' + compGrade.bg + ';color:' + compGrade.c + ';border:1px solid ' + compGrade.c + '40;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;flex-shrink:0;margin-left:8px;">' + compGrade.g + '</span>';
+    compSection += '</div>';
+    compSection += '<div style="text-align:center;">' + miniGrid(compPts, primaryKw, sz, 38) + '</div>';
+    compSection += '<div style="font-size:10px;color:#9ca3af;text-align:center;margin-top:8px;"><span style="color:#22c55e;">&#9632;</span> #1-3 &nbsp;<span style="color:#84cc16;">&#9632;</span> #4-7 &nbsp;<span style="color:#f59e0b;">&#9632;</span> #8-10 &nbsp;<span style="color:#ef4444;">&#9632;</span> #11-20 &nbsp;<span style="color:#9ca3af;">&#9632;</span> Not in top 20</div>';
+    compSection += '</div>';
+  });
+  compSection += '</td></tr>';
+
+  // STRATEGY
+  let stratSection = '<tr><td style="padding:8px 32px 0;">';
+  stratSection += '<div style="background:#FEFAF8;border:1px solid #EDD8D0;border-radius:12px;padding:20px 24px;margin-bottom:12px;">';
+  stratSection += '<div style="font-size:13px;font-weight:800;color:#1a1a2e;margin-bottom:12px;">Your 3 Biggest Opportunities</div>';
+  const targetZones = [...new Set(allStats.flatMap(x => x.s.weakZones))];
+  const opps = [];
+  if (totalAreas - overallFound > 0) opps.push({
+    title: "You're invisible in " + (targetZones.slice(0, 2).join(' & ') || 'parts of your service area'),
+    desc: 'Customers in ' + (totalAreas - overallFound) + " areas can't find you on Google Maps at all — they're calling your competitors instead.",
+  });
+  if (overallTop3 < totalAreas * 0.4) opps.push({
+    title: 'Move up to the top 3',
+    desc: "You appear in searches, but you're not in the top 3 in most areas. The top 3 results get 75%+ of clicks. Ranking #7 is nearly as bad as not ranking at all.",
+  });
+  if (topComps.length) opps.push({
+    title: 'Take back customers from ' + eH(topComps[0].n),
+    desc: eH(topComps[0].n) + ' is ranking #' + (topComps[0].avg?.toFixed(1) || '?') + " across your whole service area — here's how you can outrank them.",
+  });
+  opps.slice(0, 3).forEach(opp => {
+    stratSection += '<div style="display:flex;gap:12px;margin-bottom:14px;"><div style="font-size:20px;flex-shrink:0;"></div><div><div style="font-size:12px;font-weight:800;color:#1a1a2e;margin-bottom:3px;">' + opp.title + '</div><div style="font-size:11px;color:#6b7280;line-height:1.6;">' + opp.desc + '</div></div></div>';
+  });
+  stratSection += '</div></td></tr>';
+
+  return { execSummary, kwSection, stratSection, compSection };
+}
+
+function buildReportEmail(sd, audit, sections, prospectName) {
+  const eH = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const date = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  const catScores = crocsReport.computeAuditScores(audit);
+  if (audit && catScores && !catScores.blocked && audit.healthScore !== null) {
+    audit = { ...audit, healthScore: catScores.overallScore };
+  }
+
+  const sc = (n) => n == null ? '#9ca3af' : n >= 80 ? '#22c55e' : n >= 55 ? '#f59e0b' : '#ef4444';
+  const sb = (n) => n == null ? '#f3f4f6' : n >= 80 ? '#dcfce7' : n >= 55 ? '#fef9c3' : '#fee2e2';
+  const sl = (n) => n == null ? 'Blocked' : n >= 80 ? 'Strong' : n >= 55 ? 'Fair' : 'Weak';
+
+  function sectionHeader(title, num, subtitle) {
+    return `<tr><td style="background:#FAF7F4;height:8px;font-size:0;line-height:0;">&nbsp;</td></tr>
+    <tr><td style="background:#ffffff;padding:22px 28px 0;">
+      <table cellpadding="0" cellspacing="0" width="100%"><tr>
+        <td style="width:3px;background:#F06478;border-radius:2px;vertical-align:top;padding:0;"><div style="width:3px;height:20px;background:#F06478;border-radius:2px;"></div></td>
+        <td style="padding-left:10px;vertical-align:middle;">
+          <div style="font-size:9px;color:#F06478;font-weight:800;text-transform:uppercase;letter-spacing:.1em;">${num} ${title}</div>
+        </td>
+      </tr></table>
+      <div style="height:1.5px;background:linear-gradient(90deg,#F06478,#FAE8E0,transparent);margin-top:10px;margin-bottom:0;border-radius:1px;"></div>
+    </td></tr>`;
+  }
+  function scoreBar(label, score) {
+    const c = sc(score), bg = sb(score), lbl = sl(score);
+    const barW = score + '%';
+    const barColor = score >= 80 ? 'linear-gradient(90deg,#22c55e,#4ade80)' : score >= 55 ? 'linear-gradient(90deg,#f59e0b,#fbbf24)' : 'linear-gradient(90deg,#ef4444,#f87171)';
+    return `<div style="margin-bottom:16px;">
+      <table cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:5px;"><tr>
+        <td style="font-size:12px;font-weight:700;color:#1a1a2e;">${label}</td>
+        <td style="text-align:right;white-space:nowrap;">
+          <span style="font-size:10px;font-weight:700;color:${c};background:${bg};padding:2px 8px;border-radius:10px;">${lbl}</span>
+          &nbsp;<span style="font-family:monospace;font-size:13px;font-weight:900;color:${c};">${score}/100</span>
+        </td>
+      </tr></table>
+      <div style="background:#f3f4f6;border-radius:4px;height:8px;overflow:hidden;"><div style="height:8px;width:${barW};background:${barColor};border-radius:4px;"></div></div>
+    </div>`;
+  }
+
+  // EXEC SUMMARY
+  const kw0 = sd.kws[0];
+  const pts0 = sd.pts || [];
+  const allRanks = pts0.map(p => p.rk[kw0]).filter(r => r !== null);
+  const top3Count = allRanks.filter(r => r <= 3).length;
+  const invisCount = pts0.length - allRanks.length;
+  const avgRank = allRanks.length ? (allRanks.reduce((a, b) => a + b) / allRanks.length).toFixed(1) : null;
+  const visPct = Math.round(allRanks.length / pts0.length * 100);
+  const overallGrade = visPct >= 70 && (top3Count / pts0.length) >= 0.4
+    ? { g: 'Strong',   c: '#F06478', bg: '#FAE8E0' }
+    : visPct >= 40
+      ? { g: 'Moderate', c: '#f59e0b', bg: '#fef9c3' }
+      : { g: 'Limited',  c: '#ef4444', bg: '#fee2e2' };
+
+  const execSummary = `
+  <tr><td style="background:#FAF7F4;padding:14px 28px 16px;">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td width="48%" style="vertical-align:top;padding-right:8px;">
+        <div style="background:${overallGrade.bg};border:2px solid ${overallGrade.c};border-radius:14px;padding:18px 16px;text-align:center;height:100%;box-sizing:border-box;">
+          <div style="font-size:10px;font-weight:800;color:${overallGrade.c};text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Google Maps Ranking</div>
+          <div style="font-size:44px;font-weight:900;color:${overallGrade.c};line-height:1;margin-bottom:4px;">${overallGrade.g}</div>
+          <div style="font-size:11px;color:#6b7280;">5&times;5 &middot; 2 keywords &middot; ${sd.rad}mi radius</div>
+        </div>
+      </td>
+      <td width="48%" style="vertical-align:top;padding-left:8px;">
+        ${audit ? `<div style="background:${sb(audit.healthScore)};border:2px solid ${sc(audit.healthScore)};border-radius:14px;padding:18px 16px;text-align:center;">
+          <div style="font-size:10px;font-weight:800;color:${sc(audit.healthScore)};text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Website Score</div>
+          ${audit.crawlBlocked || audit.healthScore === null
+            ? `<div style="font-size:22px;font-weight:900;color:#9ca3af;line-height:1;margin-bottom:4px;">Couldn't crawl</div><div style="font-size:11px;color:#9ca3af;">Site blocked crawlers or returned no data</div>`
+            : `<div style="font-size:44px;font-weight:900;color:${sc(audit.healthScore)};line-height:1;margin-bottom:4px;">${audit.healthScore}<span style="font-size:18px;">/100</span></div><div style="font-size:11px;color:#6b7280;">${audit.totalPages} pages &middot; ${audit.criticalIssues} critical issues</div>`}
+        </div>` : `<div style="background:#f9fafb;border:2px dashed #e5e7eb;border-radius:14px;padding:18px 16px;text-align:center;color:#9ca3af;"><div style="font-size:11px;">Website audit not run</div></div>`}
+      </td>
+    </tr></table>
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:12px;"><tr>
+      <td style="text-align:center;padding:0 4px;"><div style="background:#ffffff;border:1px solid #EDD8D0;border-radius:10px;padding:12px 8px;"><div style="font-size:22px;font-weight:900;color:#ef4444;">${invisCount}</div><div style="font-size:10px;color:#6b7280;margin-top:2px;">Can't Find You</div></div></td>
+      <td style="text-align:center;padding:0 4px;"><div style="background:#ffffff;border:1px solid #EDD8D0;border-radius:10px;padding:12px 8px;"><div style="font-size:22px;font-weight:900;color:#F06478;">${top3Count}</div><div style="font-size:10px;color:#6b7280;margin-top:2px;">Top 3 on Google</div></div></td>
+      <td style="text-align:center;padding:0 4px;"><div style="background:#ffffff;border:1px solid #EDD8D0;border-radius:10px;padding:12px 8px;"><div style="font-size:22px;font-weight:900;color:#F06478;">${visPct}%</div><div style="font-size:10px;color:#6b7280;margin-top:2px;">Found on Google</div></div></td>
+      <td style="text-align:center;padding:0 4px;"><div style="background:#ffffff;border:1px solid #EDD8D0;border-radius:10px;padding:12px 8px;"><div style="font-size:22px;font-weight:900;color:#1a1a2e;">${avgRank ? '#' + avgRank : '—'}</div><div style="font-size:10px;color:#6b7280;margin-top:2px;">Avg Rank</div></div></td>
+      ${audit && !audit.crawlBlocked && audit.healthScore !== null ? `<td style="text-align:center;padding:0 4px;"><div style="background:#ffffff;border:1px solid #EDD8D0;border-radius:10px;padding:12px 8px;"><div style="font-size:22px;font-weight:900;color:#ef4444;">${audit.criticalIssues}</div><div style="font-size:10px;color:#6b7280;margin-top:2px;">Website Errors</div></div></td>` : ''}
+    </tr></table>
+    <div style="margin-top:10px;background:#F2EDE8;border:1px solid #EDD8D0;border-radius:10px;padding:11px 14px;">
+      <div style="font-size:11px;color:#374151;line-height:1.65;">${overallGrade.g === 'Strong'
+        ? `Top 3 in <strong>${top3Count} of ${sd.pts.length} areas</strong> for <em>${eH(kw0)}</em>${audit && audit.criticalIssues > 0 ? ' But the website has <strong>' + audit.criticalIssues + ' issues</strong> that need fixing before they hurt those rankings.' : " Focus on holding those positions so competitors can't catch up."}`
+        : overallGrade.g === 'Moderate'
+          ? `Visible in <strong>${visPct}%</strong> of the service area — invisible in <strong>${invisCount} zones</strong>. Those customers are calling competitors instead${audit && audit.criticalIssues > 0 ? ` + <strong>${audit.criticalIssues} site issues</strong> compounding the problem.` : '.'}`
+          : `Invisible in <strong>${invisCount} of ${pts0.length} areas</strong> for <em>${eH(kw0)}</em>${audit && audit.criticalIssues > 0 ? ' The website also has <strong>' + audit.criticalIssues + ' issues</strong> making it harder for Google to rank the site.' : ". Most customers in the area simply can't find this business on Google."}`}</div>
+    </div>
+  </td></tr>`;
+
+  // STRATEGY (top-fixes list)
+  const allFixes = [];
+  if (audit) {
+    const imap = {};
+    (audit.topIssues || []).forEach(i => { imap[i.key] = i.count; });
+    const fixDefs = [
+      { key: 'is_broken', sev: 'CRITICAL', label: 'Fix broken pages', detail: c => `${c} page${c>1?'s are':' is'} returning 404 errors. These damage user experience and directly hurt your rankings.` },
+      { key: 'is_4xx_code', sev: 'CRITICAL', label: 'Resolve 4xx error pages', detail: c => `${c} page${c>1?'s have':' has'} client-side errors. Google treats these as signs of a poorly maintained site.` },
+      { key: 'is_5xx_code', sev: 'CRITICAL', label: 'Fix server errors (5xx)', detail: c => `${c} page${c>1?'s are':' is'} showing server errors. This is a serious red flag for Google.` },
+      { key: 'has_no_title', sev: 'CRITICAL', label: 'Add a title to your web pages', detail: c => `${c} page${c>1?'s have':' has'} no title. Without it Google has no idea what the page is about.` },
+      { key: 'has_no_description', sev: 'HIGH', label: 'Add a description to your pages', detail: c => `${c} page${c>1?'s are':' is'} missing a description. Without it people skip past your listing in search results.` },
+      { key: 'has_no_h1_tags', sev: 'HIGH', label: 'Add a main headline to each page', detail: c => `${c} page${c>1?'s have':' has'} no main heading. Missing it hurts your rankings.` },
+      { key: 'has_duplicate_title', sev: 'HIGH', label: 'Fix duplicate page titles', detail: c => `${c} page${c>1?'s have':' has'} the same title as another page. Each page needs its own unique title.` },
+      { key: 'has_no_canonical', sev: 'HIGH', label: 'Add canonical tags to your pages', detail: c => `${c} page${c>1?'s are':' is'} missing a canonical tag. This prevents duplicate content from hurting rankings.` },
+      { key: 'has_no_micromarkup', sev: 'MED', label: 'Add schema markup to your site', detail: c => `${c} page${c>1?'s have':' has'} no structured data. Schema markup directly helps local rankings.` },
+      { key: 'has_no_image_alt', sev: 'MED', label: 'Describe your images for Google', detail: c => `${c} image${c>1?'s have':' has'} no description. This helps your site show up in Google Images too.` },
+      { key: 'is_http', sev: 'CRITICAL', label: 'Your site is not using HTTPS', detail: c => `${c} page${c>1?'s are':' is'} being served without SSL. Google marks HTTP sites as "Not Secure" and ranks them lower.` },
+    ];
+    fixDefs.forEach(def => { if (imap[def.key] > 0) allFixes.push({ source: 'website', sev: def.sev, label: def.label, detail: def.detail(imap[def.key]), count: imap[def.key], key: def.key }); });
+    if (audit.hasSSL === false && !audit.crawlBlocked) allFixes.unshift({ source: 'website', sev: 'CRITICAL', label: 'Switch your site to HTTPS', detail: 'Your site is running on HTTP, not HTTPS. Google marks these as "Not Secure" and ranks them lower.' });
+    if (audit.hasSitemap === false && audit.totalPages > 3) allFixes.push({ source: 'website', sev: 'HIGH', label: 'Create a sitemap.xml', detail: 'A sitemap tells Google every page on your site. Without one, some pages may never get indexed.' });
+    if (audit.hasRobots === false) allFixes.push({ source: 'website', sev: 'HIGH', label: 'Add a robots.txt file', detail: 'Without robots.txt, Google has to guess how to crawl your site and might miss pages.' });
+  }
+  if (invisCount > sd.pts.length * 0.4) allFixes.push({ source: 'local', sev: 'CRITICAL', label: 'Tell Google where you actually work', detail: `You're not showing up in ${invisCount} of ${sd.pts.length} areas. Add every city and zip you serve to your Google Business Profile.` });
+  if ((top3Count / sd.pts.length) < 0.3) allFixes.push({ source: 'local', sev: 'HIGH', label: 'Get more Google reviews', detail: `You're only in the top 3 in ${top3Count} of ${sd.pts.length} areas. Reviews are the #1 thing Google uses to rank local businesses.` });
+
+  const sevOrder = { CRITICAL: 0, HIGH: 1, MED: 2, LOW: 3 };
+  allFixes.sort((a, b) => sevOrder[a.sev] - sevOrder[b.sev]);
+  const sevColors = { CRITICAL: '#ef4444', HIGH: '#f59e0b', MED: '#F06478', LOW: '#6b7280' };
+  const sevBg     = { CRITICAL: '#fee2e2', HIGH: '#fef3c7', MED: '#e6f7f6', LOW: '#f3f4f6' };
+  const sourceIcon = (s) => s === 'local'
+    ? `<span style="font-size:8px;font-weight:800;color:#D94060;background:#FAE8E0;padding:2px 6px;border-radius:6px;letter-spacing:.03em;">LOCAL</span>`
+    : `<span style="font-size:8px;font-weight:800;color:#D94060;background:#FAE8E0;padding:2px 6px;border-radius:6px;letter-spacing:.03em;">SITE</span>`;
+  const topFixesSection = `<tr><td style="background:#FAF7F4;padding:14px 28px 20px;">
+    ${allFixes.length === 0 ? `<div style="text-align:center;padding:24px;background:#f0fdf9;border:1px solid #bbf7d0;border-radius:12px;"><div style="font-size:24px;margin-bottom:8px;">🎉</div><div style="font-size:14px;font-weight:700;color:#166534;">No critical fixes needed</div></div>` : ''}
+    ${allFixes.slice(0, 10).map((fix, i) => `
+    <div style="display:flex;gap:12px;margin-bottom:10px;padding:12px 14px;background:#ffffff;border:1px solid #EDD8D0;border-radius:10px;border-left:4px solid ${sevColors[fix.sev]};">
+      <div style="flex-shrink:0;font-family:monospace;font-size:12px;font-weight:900;color:${sevColors[fix.sev]};width:20px;text-align:center;padding-top:1px;">${i + 1}</div>
+      <div style="flex:1;">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+          <span>${sourceIcon(fix.source)}</span>
+          <span style="font-size:12px;font-weight:800;color:#1a1a2e;">${fix.label}</span>
+          <span style="font-size:9px;font-weight:800;color:${sevColors[fix.sev]};background:${sevBg[fix.sev]};padding:2px 6px;border-radius:8px;flex-shrink:0;">${fix.sev}</span>
+        </div>
+        <div style="font-size:10px;color:#6b7280;line-height:1.6;">${fix.detail}</div>
+      </div>
+    </div>`).join('')}
+  </td></tr>`;
+
+  // ASSEMBLE
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>${eH(sd.biz)} — Google Maps & Website Report</title></head>
+<body style="margin:0;padding:0;background:#FAF7F4;font-family:system-ui,-apple-system,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#FAF7F4;padding:24px 0;"><tr><td>
+<table width="640" cellpadding="0" cellspacing="0" align="center" style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 4px 40px rgba(15,15,26,.12);">
+
+<tr><td style="background:linear-gradient(135deg,#0f0f1a,#1a1a2e,#252540);padding:24px 32px 22px;position:relative;">
+  <div style="position:absolute;bottom:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#F06478,#e8855a,#5BC4D0);"></div>
+  <table cellpadding="0" cellspacing="0" style="margin-bottom:16px;"><tr>
+    <td style="vertical-align:middle;padding-right:10px;"><img src="${CROCS_WORKER_URL}/logo.png" alt="Croc's and Clicks" width="48" height="48" style="display:block;width:48px;height:48px;border-radius:8px;"></td>
+    <td style="vertical-align:middle;"><div style="font-size:13px;font-weight:800;color:#ffffff;letter-spacing:.01em;">Croc's &amp; Clicks</div><div style="font-size:9px;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.1em;margin-top:1px;">SEO Audit &nbsp;·&nbsp; ${date}</div></td>
+  </tr></table>
+  <div style="font-size:26px;font-weight:900;color:#ffffff;line-height:1.15;margin-bottom:4px;">${eH(sd.biz)}</div>
+  <div style="font-size:12px;color:rgba(255,255,255,.45);margin-bottom:16px;">${eH(sd.addr || '')}</div>
+</td></tr>
+
+<tr><td style="background:#fff;padding:16px 28px;border-bottom:2px solid #FAF7F4;">
+  <p style="font-size:13px;color:#374151;line-height:1.7;margin:0;">Hi ${eH(prospectName || 'there')}, we pulled your Google Maps rankings and ran a quick audit of your website. Here's exactly where you stand and what's holding you back.</p>
+</td></tr>
+
+${sectionHeader('Your Google Snapshot', '01', '')}
+${execSummary}
+
+${sectionHeader('Where You Show Up on Google Maps', '02', '')}
+${sections.kwSection}
+
+${sectionHeader("What's Hurting Your Rankings", '03', '')}
+${sections.stratSection}
+
+${sectionHeader("Who's Beating You Right Now", '04', '')}
+${sections.compSection}
+
+${audit && catScores && !catScores.blocked ? `${sectionHeader('Your Website Health Check', '05', '')}
+<tr><td style="background:#ffffff;padding:8px 32px 24px;">
+  <div style="padding:16px 20px;background:#fff;border:1px solid #e8dede;border-radius:12px;">
+    ${scoreBar('On-Page SEO', catScores.seoScore)}
+    ${scoreBar('Technical Health', catScores.techScore)}
+    ${scoreBar('Content Quality', catScores.contentScore)}
+    ${scoreBar('Link & Media Health', catScores.linkScore)}
+    ${scoreBar('Local SEO Setup', catScores.localSeoScore)}
+  </div>
+</td></tr>` : ''}
+
+${sectionHeader('Top Fixes', '06', '')}
+${topFixesSection}
+
+<tr><td style="background:#fff;padding:8px 32px 36px;">
+  <div style="background:linear-gradient(135deg,#1a1a2e 0%,#1a1a2e 50%,#1a1a2e 100%);border-radius:14px;padding:28px 30px;text-align:center;position:relative;overflow:hidden;">
+    <div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#F06478,#e8855a,#5BC4D0);"></div>
+    <div style="font-size:19px;font-weight:900;color:#fff;margin-bottom:12px;line-height:1.35;">Let's talk through this and put together<br>a plan that actually gets you more calls</div>
+    <a href="https://crocsandclicks.com/contact" style="display:inline-block;background:linear-gradient(135deg,#F06478,#D94060);color:#fff;font-weight:900;font-size:14px;padding:14px 40px;border-radius:10px;text-decoration:none;letter-spacing:.01em;box-shadow:0 4px 20px rgba(240,100,120,.4);">Book a Free 20-Minute Call →</a>
+    <div style="margin-top:14px;font-size:10px;color:rgba(255,255,255,.35);">We're based in Vancouver, WA — usually respond within a few hours</div>
+  </div>
+</td></tr>
+
+<tr><td style="background:#0f0f1a;padding:20px 32px;text-align:center;">
+  <div style="font-size:11px;color:rgba(255,255,255,.25);line-height:1.8;">
+    <div style="color:rgba(255,255,255,.45);font-weight:700;margin-bottom:4px;">Croc's &amp; Clicks — Full-Service Marketing Agency</div>
+    <div>Vancouver, WA &nbsp;·&nbsp; <a href="https://crocsandclicks.com" target="_blank" style="color:rgba(255,255,255,.45);text-decoration:none;">crocsandclicks.com</a> &nbsp;·&nbsp; <a href="mailto:ben@crocsandclicks.com" style="color:rgba(255,255,255,.45);text-decoration:none;">ben@crocsandclicks.com</a></div>
+    <div style="margin-top:8px;font-size:10px;">Report generated ${date} &nbsp;·&nbsp; ${sd.pts.length} grid points scanned</div>
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);font-size:10px;color:rgba(255,255,255,.2);">We sent this because we ran your Google Maps rankings and wanted to share what we found.<br><a href="mailto:ben@crocsandclicks.com?subject=Unsubscribe&body=Please remove ${eH(sd.biz)} from your mailing list." style="color:rgba(255,255,255,.3);text-decoration:underline;">Unsubscribe</a></div>
+  </div>
+</td></tr>
+
+</table></td></tr></table></body></html>`;
+}
+
+// Orchestrator: runs grid scan + audit + builds HTML + sends via Worker.
+// Returns { ok, messageId, error }.
+async function runAutoReportForAccount(account, { contact, sendTo, prospectName, dispatch }) {
+  // 1. Validate inputs
+  if (!sendTo || !sendTo.includes('@')) return { ok: false, error: 'No recipient email' };
+
+  // 2. Derive keywords
+  const kws = crocsReport.deriveKeywords(account);
+  if (!kws.length) return { ok: false, error: 'No keywords derivable from account' };
+
+  // 3. Resolve business location (cached or fresh lookup)
+  let biz;
+  try { biz = await crocsReport.resolveBusinessLocation(account, dispatch); }
+  catch (e) { return { ok: false, error: 'GBP lookup: ' + e.message }; }
+
+  // 4. Run grid scan + site audit in parallel
+  const domain = (account.website || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+  const [gridSettled, auditSettled] = await Promise.allSettled([
+    crocsReport.runGridScan(biz, kws, 5),
+    domain ? crocsReport.runSiteAudit(domain) : Promise.resolve(null),
+  ]);
+  if (gridSettled.status !== 'fulfilled' || !gridSettled.value?.pts?.length) {
+    return { ok: false, error: 'Grid scan failed: ' + (gridSettled.reason?.message || 'no data') };
+  }
+  const grid  = gridSettled.value;
+  const audit = auditSettled.status === 'fulfilled' ? auditSettled.value : null;
+
+  // 5. Build HTML
+  const sections = buildReportGridSections(grid);
+  const html     = buildReportEmail(grid, audit, sections, prospectName);
+
+  // 6. Send via Worker → Resend
+  const subject = `${new Date().toLocaleDateString('en-US', { month: 'long' })} SEO Report — Croc's & Clicks`;
+  try {
+    const sent = await crocsReport.workerPost('/send-html-email', {
+      to: sendTo,
+      name: prospectName || '',
+      subject,
+      html,
+      biz: account.name,
+    });
+    return { ok: true, messageId: sent.id || null, subject };
+  } catch (e) {
+    return { ok: false, error: 'Send: ' + e.message };
+  }
+}
+
+/* =====================================================================
    GMAIL — reuses the same Google OAuth token as gcal (one consent grants
    both calendar.events + gmail.send + gmail.readonly).
    ===================================================================== */
@@ -4489,6 +5508,35 @@ function CadenceListView() {
     notify(dispatch, 'Step complete — cadence advanced.');
   }
 
+  async function runReportNow(row) {
+    if (!row.currentTask || !row.account) return;
+    const account = row.account;
+    const contacts = state.allContacts.filter(c => c.account_id === account.id);
+    const primary = contacts.find(c => c.is_primary) || contacts[0];
+    const sendTo = primary?.email || account.email;
+    if (!sendTo) return notify(dispatch, 'No recipient email on account or primary contact.', 'error');
+    if (!confirm(`Generate and send SEO report to ${sendTo}?\n\nThis will run a Google Maps grid scan + site audit (takes ~30-90 seconds) then send a personalized email.`)) return;
+    notify(dispatch, `Generating report for ${account.name}…`);
+    const result = await runAutoReportForAccount(account, {
+      sendTo,
+      prospectName: primary?.first_name || '',
+      dispatch,
+    });
+    if (!result.ok) return notify(dispatch, `Report failed: ${result.error}`, 'error');
+    const completedAt = new Date().toISOString();
+    const { data: updatedTask } = await supabase.from('tasks').update({ completed_at: completedAt }).eq('id', row.currentTask.id).select().single();
+    if (updatedTask) dispatch({ type: 'UPSERT_TASK', task: updatedTask });
+    const { data: act } = await supabase.from('activities').insert({
+      account_id: account.id, contact_id: primary?.id || null, user_id: account.owner_id,
+      type: 'email', subject: result.subject || 'SEO Report sent',
+      body: `Auto-sent SEO report to ${sendTo}`, occurred_at: completedAt,
+      email_to: sendTo, email_from: 'ben@crocsandclicks.com', email_subject: result.subject,
+    }).select().single();
+    if (act) dispatch({ type: 'ADD_ACTIVITY', activity: act });
+    await advanceCadenceFromCompletedTask({ taskId: row.currentTask.id, state, dispatch });
+    notify(dispatch, `📊 Report sent to ${sendTo}`);
+  }
+
   return (
     <div className="flex flex-1 overflow-hidden">
       <div className={classNames('border-r border-gray-200 bg-white transition-all w-72')}>
@@ -4553,6 +5601,9 @@ function CadenceListView() {
                     </td>
                     <td className="px-3 py-2 text-sm text-gray-700 whitespace-nowrap">{r.rep?.full_name || '—'}</td>
                     <td className="px-3 py-2 text-right whitespace-nowrap">
+                      {!isComplete && r.currentTask && r.currentStep?.step_type === 'auto_email_report' && (
+                        <Button size="sm" className="mr-1" onClick={() => runReportNow(r)}>📊 Run report</Button>
+                      )}
                       {!isComplete && r.currentTask && (
                         <Button size="sm" variant="secondary" onClick={() => markDone(r)}>Mark done</Button>
                       )}
@@ -5557,6 +6608,90 @@ function App() {
       dispatch({ type: 'SET_LOADING', loading: false });
     })();
   }, [state.user?.id]);
+
+  // Auto-report runner — scans for due auto_email_report cadence tasks
+  // assigned to the current user and fires them in the background.
+  const autoReportRunningRef = useRef(new Set());
+  useEffect(() => {
+    if (!state.profile?.id) return;
+    if (!state.cadenceEnrollments.length) return;
+
+    let cancelled = false;
+
+    async function runDueAutoReports() {
+      const now = new Date();
+      const myUid = state.profile.id;
+      const eligible = state.cadenceEnrollments.filter(e => {
+        if (e.status !== 'active' || !e.current_task_id) return false;
+        const steps = state.cadenceSteps.filter(s => s.cadence_id === e.cadence_id);
+        const cur = steps.find(s => s.step_order === e.current_step_order);
+        if (!cur || cur.step_type !== 'auto_email_report') return false;
+        const task = state.allTasks.find(t => t.id === e.current_task_id);
+        if (!task || task.completed_at) return false;
+        if (!task.due_at || new Date(task.due_at) > now) return false;
+        const acct = state.accounts.find(a => a.id === e.account_id);
+        if (!acct || acct.owner_id !== myUid) return false; // only owner fires
+        if (autoReportRunningRef.current.has(task.id)) return false;
+        return true;
+      });
+
+      for (const enrollment of eligible) {
+        if (cancelled) return;
+        const task = state.allTasks.find(t => t.id === enrollment.current_task_id);
+        if (!task) continue;
+        autoReportRunningRef.current.add(task.id);
+        try {
+          const account = state.accounts.find(a => a.id === enrollment.account_id);
+          const contacts = state.allContacts.filter(c => c.account_id === account.id);
+          const primary = contacts.find(c => c.is_primary) || contacts[0];
+          const sendTo = primary?.email || account.email;
+          if (!sendTo) {
+            await supabase.from('tasks').update({
+              notes: ((task.notes || '') + `\n[${new Date().toLocaleString()}] Auto-report skipped: no recipient email on account or primary contact.`).trim(),
+            }).eq('id', task.id);
+            continue;
+          }
+          const prospectName = primary?.first_name || '';
+          notify(dispatch, `Generating auto-report for ${account.name}…`);
+          const result = await runAutoReportForAccount(account, { sendTo, prospectName, dispatch });
+          if (result.ok) {
+            const completedAt = new Date().toISOString();
+            const { data: updatedTask } = await supabase.from('tasks').update({ completed_at: completedAt }).eq('id', task.id).select().single();
+            if (updatedTask) dispatch({ type: 'UPSERT_TASK', task: updatedTask });
+            const { data: act } = await supabase.from('activities').insert({
+              account_id: account.id,
+              contact_id: primary?.id || null,
+              user_id: account.owner_id,
+              type: 'email',
+              subject: result.subject || 'SEO Report sent',
+              body: `Auto-sent SEO report to ${sendTo}`,
+              occurred_at: completedAt,
+              email_to: sendTo,
+              email_from: 'ben@crocsandclicks.com',
+              email_subject: result.subject,
+            }).select().single();
+            if (act) dispatch({ type: 'ADD_ACTIVITY', activity: act });
+            await advanceCadenceFromCompletedTask({ taskId: task.id, state, dispatch });
+            notify(dispatch, `📊 Auto-report sent to ${sendTo} (${account.name})`);
+          } else {
+            await supabase.from('tasks').update({
+              notes: ((task.notes || '') + `\n[${new Date().toLocaleString()}] Auto-report failed: ${result.error}`).trim(),
+            }).eq('id', task.id);
+            notify(dispatch, `Auto-report failed for ${account.name}: ${result.error}`, 'error');
+          }
+        } catch (err) {
+          console.error('[auto-report] uncaught', err);
+        } finally {
+          autoReportRunningRef.current.delete(task.id);
+        }
+      }
+    }
+
+    // Run once on mount/data-change, then every 10 minutes while CRM is open
+    runDueAutoReports();
+    const intervalId = setInterval(runDueAutoReports, 10 * 60 * 1000);
+    return () => { cancelled = true; clearInterval(intervalId); };
+  }, [state.profile?.id, state.cadenceEnrollments.length, state.allTasks.length]);
 
   // Twilio Voice — register a Device for this user once authed, refresh token before expiry.
   const twilioDeviceRef = useRef(null);
