@@ -1132,7 +1132,7 @@ function buildReportEmail(sd, audit, sections, prospectName) {
   const sb = (n) => n == null ? '#f3f4f6' : n >= 80 ? '#dcfce7' : n >= 55 ? '#fef9c3' : '#fee2e2';
   const sl = (n) => n == null ? 'Blocked' : n >= 80 ? 'Strong' : n >= 55 ? 'Fair' : 'Weak';
 
-  function sectionHeader(title, num, subtitle) {
+  function sectionHeader(title, num) {
     return `<tr><td style="background:#FAF7F4;height:8px;font-size:0;line-height:0;">&nbsp;</td></tr>
     <tr><td style="background:#ffffff;padding:22px 28px 0;">
       <table cellpadding="0" cellspacing="0" width="100%"><tr>
@@ -1160,7 +1160,7 @@ function buildReportEmail(sd, audit, sections, prospectName) {
     </div>`;
   }
 
-  // EXEC SUMMARY
+  // ─── SECTION 1: EXECUTIVE SUMMARY ────────────────────────────────────
   const kw0 = sd.kws[0];
   const pts0 = sd.pts || [];
   const allRanks = pts0.map(p => p.rk[kw0]).filter(r => r !== null);
@@ -1174,7 +1174,7 @@ function buildReportEmail(sd, audit, sections, prospectName) {
       ? { g: 'Moderate', c: '#f59e0b', bg: '#fef9c3' }
       : { g: 'Limited',  c: '#ef4444', bg: '#fee2e2' };
 
-  const execSummary = `
+  const execSummarySection = `
   <tr><td style="background:#FAF7F4;padding:14px 28px 16px;">
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
       <td width="48%" style="vertical-align:top;padding-right:8px;">
@@ -1209,62 +1209,207 @@ function buildReportEmail(sd, audit, sections, prospectName) {
     </div>
   </td></tr>`;
 
-  // STRATEGY (top-fixes list)
+  // ─── VIDEO BRIDGE ────────────────────────────────────────────────────
+  const videoBridgeSection = `<tr><td style="background:#fff;padding:0 32px 28px;">
+    <p style="font-size:11px;color:#9ca3af;line-height:1.6;margin:0 0 10px;"><em>90 seconds on why your position on Google Maps determines whether customers find you or your competitor.</em></p>
+    <a href="https://youtu.be/XdMuY64S42E?si=dtXaYXLHSfegwHut" target="_blank" style="display:block;text-decoration:none;border-radius:10px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.15);">
+      <img src="https://img.youtube.com/vi/XdMuY64S42E/maxresdefault.jpg" alt="Learn How To Analyze Your Rank On Google" width="100%" style="display:block;width:100%;border-radius:10px;">
+    </a>
+    <div style="text-align:center;margin-top:10px;">
+      <a href="https://youtu.be/XdMuY64S42E?si=dtXaYXLHSfegwHut" target="_blank" style="font-size:11px;color:#F06478;font-weight:700;text-decoration:none;letter-spacing:.02em;">▶ Watch on YouTube &nbsp;(~90 seconds)</a>
+    </div>
+  </td></tr>`;
+
+  // ─── SECTION 3: STRATEGIC ANALYSIS (priority pills) ─────────────────
+  const _kwsSd = sd.kws || [];
+  const _ptsSd = sd.pts || [];
+  const _ptsSecSd = sd.ptsSec || sd.pts || [];
+  const allStats = _kwsSd.map(kw => {
+    const idx = _kwsSd.indexOf(kw);
+    const _kwPts = idx > 0 ? _ptsSecSd : _ptsSd;
+    const _kwSz = idx > 0 ? (sd.szSec || 5) : (sd.sz || 5);
+    const r = _kwPts.map(p => p.rk[kw]).filter(x => x !== null);
+    const top3 = r.filter(x => x <= 3).length;
+    const avg = r.length ? r.reduce((a, b) => a + b) / r.length : null;
+    const mid = Math.floor(_kwSz / 2);
+    const innerR = _kwPts.filter((p, i) => Math.abs(Math.floor(i / _kwSz) - mid) <= 1 && Math.abs((i % _kwSz) - mid) <= 1).map(p => p.rk[kw]).filter(x => x !== null);
+    const outerR = _kwPts.filter((p, i) => !(Math.abs(Math.floor(i / _kwSz) - mid) <= 1 && Math.abs((i % _kwSz) - mid) <= 1)).map(p => p.rk[kw]).filter(x => x !== null);
+    return { kw, found: r.length, top3, total: _kwPts.length, avg, vis: r.length / _kwPts.length, innerAvg: innerR.length ? innerR.reduce((a, b) => a + b) / innerR.length : null, outerAvg: outerR.length ? outerR.reduce((a, b) => a + b) / outerR.length : null };
+  });
+  const topComps = (sd.compsByKw && sd.compsByKw[sd.kws[0]]) || [];
+  const topCompName = topComps[0]?.n || null;
+  const hasCenterStrong = allStats.some(s => s.innerAvg && s.outerAvg && s.outerAvg > s.innerAvg + 3);
+  const hasLowTop3 = (top3Count / (_ptsSd.length || 1)) < 0.35;
+  const hasLowVis = visPct < 50;
+
+  const stratActions = [];
+  if (hasLowVis) stratActions.push({ priority: 'HIGH', title: 'Tell Google where you actually work', detail: `You're not showing up in ${invisCount} neighborhoods. Go into your Google Business Profile and add every city and zip code you service — don't let Google guess where you work.` });
+  if (hasLowTop3 || visPct < 70) stratActions.push({ priority: hasLowTop3 ? 'HIGH' : 'MED', title: 'Get more Google reviews', detail: `Reviews are the #1 thing Google uses to decide who shows up first. You need a system to ask every customer. Even 5 new reviews a month makes a real difference.` });
+  if (hasCenterStrong) stratActions.push({ priority: 'MED', title: 'Add location pages to your website', detail: `Your rankings drop off the further you get from your address. A simple page on your site for each neighborhood you serve helps Google know you work there.` });
+  if (topCompName) stratActions.push({ priority: 'MED', title: `Outpace ${eH(topCompName)} with content + citations`, detail: `${eH(topCompName)} is your strongest competitor, averaging rank #${topComps[0]?.avg?.toFixed(1)}. Audit their backlinks and citation sources, then build the same ones. Match or exceed their Google Business Profile completeness.` });
+  if (audit && audit.criticalIssues > 0) stratActions.push({ priority: 'HIGH', title: `Fix ${audit.criticalIssues} critical website issues first`, detail: `Google can't rank a technically broken website effectively. Resolving these issues removes friction in how Google crawls and understands your pages — a prerequisite for any other SEO effort.` });
+  if (audit && catScores && !catScores.blocked && catScores.seoScore !== null && catScores.seoScore < 60) stratActions.push({ priority: 'HIGH', title: 'Fix on-page SEO: titles, descriptions and headings', detail: `Your on-page SEO score is ${catScores.seoScore}/100. Pages without proper title tags and meta descriptions miss out on keyword targeting entirely. These are quick wins that directly affect click-through rates from search results.` });
+  if (!stratActions.length) stratActions.push({ priority: 'MED', title: "Protect what's working", detail: "Your rankings are solid. Keep getting reviews and keep your Google Business Profile up to date so competitors can't catch up." });
+
+  const priorityColor = p => p === 'HIGH' ? '#ef4444' : p === 'MED' ? '#F06478' : '#6b7280';
+  const priorityBg    = p => p === 'HIGH' ? '#fee2e2' : p === 'MED' ? '#fef3c7' : '#e6f7f6';
+
+  const strategicSection = `<tr><td style="background:#FAF7F4;padding:14px 28px 18px;">
+    ${stratActions.map((a, i) => `
+    <div style="padding:14px 16px;margin-bottom:${i < stratActions.length - 1 ? '10px' : '0'};border-radius:10px;border-left:4px solid ${priorityColor(a.priority)};background:#ffffff;border-top:1px solid #EDD8D0;border-right:1px solid #EDD8D0;border-bottom:1px solid #EDD8D0;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <div style="font-size:12px;font-weight:800;color:#1a1a2e;">${a.title}</div>
+        <span style="font-size:9px;font-weight:800;color:${priorityColor(a.priority)};background:${priorityBg(a.priority)};padding:2px 7px;border-radius:10px;flex-shrink:0;">${a.priority}</span>
+      </div>
+      <div style="font-size:10px;color:#6b7280;line-height:1.55;">${a.detail}</div>
+    </div>`).join('')}
+  </td></tr>`;
+
+  // ─── SECTION 5: WEBSITE AUDIT SCORES (full layout with score circle) ─
+  let auditScoresSection = '';
+  if (audit && (catScores || audit.crawlBlocked)) {
+    const imap = {};
+    (audit.topIssues || []).forEach(i => { imap[i.key] = i.count; });
+    auditScoresSection = `<tr><td style="background:#ffffff;padding:8px 32px 24px;">
+      <table cellpadding="0" cellspacing="0" width="100%" style="background:#ffffff;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:20px;">
+      <tr>
+        <td style="padding:20px 16px 20px 20px;width:84px;vertical-align:middle;text-align:center;">
+          <div style="flex-shrink:0;text-align:center;width:84px;">
+            <table cellpadding="0" cellspacing="0" style="margin:0 auto;">
+              <tr><td style="width:76px;height:76px;border-radius:50%;background:${audit.crawlBlocked?'#f3f4f6':sb(audit.healthScore)};border:4px solid ${audit.crawlBlocked?'#9ca3af':sc(audit.healthScore)};text-align:center;vertical-align:middle;">
+                <div style="font-size:${audit.crawlBlocked?'13':'26'}px;font-weight:900;color:${audit.crawlBlocked?'#6b7280':sc(audit.healthScore)};line-height:1.1;">${audit.crawlBlocked?'?':audit.healthScore}</div>
+                ${audit.crawlBlocked?'':'<div style="font-size:10px;font-weight:700;color:'+sc(audit.healthScore)+';">/100</div>'}
+              </td></tr>
+            </table>
+            <div style="font-size:10px;font-weight:800;color:${audit.crawlBlocked?'#6b7280':sc(audit.healthScore)};text-transform:uppercase;letter-spacing:.04em;margin-top:6px;">${audit.crawlBlocked?'BLOCKED':sl(audit.healthScore)}</div>
+          </div>
+        </td>
+        <td style="padding:20px 20px 20px 4px;vertical-align:middle;">
+          <div style="font-size:10px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;">Website Audit</div>
+          <a href="https://${eH(audit.domain)}" target="_blank" style="font-size:16px;font-weight:800;color:#1a1a2e;text-decoration:none;display:block;margin-bottom:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${eH(audit.domain)}</a>
+          <div>
+            <span style="font-size:11px;color:#6b7280;">${audit.totalPages} pages crawled</span>
+            &nbsp;·&nbsp;
+            <span style="font-size:11px;font-weight:700;color:${audit.criticalIssues>0?'#ef4444':'#6b7280'};">&#9679; ${audit.criticalIssues} critical</span>
+            &nbsp;·&nbsp;
+            <span style="font-size:11px;font-weight:700;color:${audit.warnings>0?'#f59e0b':'#6b7280'};">&#9679; ${audit.warnings} warnings</span>
+            &nbsp;·&nbsp;
+            <span style="font-size:11px;font-weight:700;color:${audit.hasSSL===false?'#ef4444':'#22c55e'};">&#9679; ${audit.hasSSL===false?'No HTTPS':'HTTPS OK'}</span>
+            &nbsp;·&nbsp;
+            <span style="font-size:11px;font-weight:700;color:${audit.hasSitemap?'#22c55e':'#f59e0b'};">&#9679; ${audit.hasSitemap?'Sitemap OK':'No sitemap'}</span>
+          </div>
+          ${audit.crawlBlocked?'<div style="margin-top:8px;font-size:10px;color:#92400e;background:#fef3c7;padding:5px 10px;border-radius:6px;">⚠ Site appears blocked — score unreliable</div>':''}
+          ${audit.crawlTimedOut?'<div style="margin-top:8px;font-size:10px;color:#6b7280;background:#f3f4f6;padding:5px 10px;border-radius:6px;">⚠ Partial crawl — timed out after 4 min</div>':''}
+        </td>
+      </tr>
+      </table>
+      <div style="padding:16px 20px;background:#fff;border:1px solid #e8dede;border-radius:12px;">
+        ${audit.crawlBlocked
+          ? '<div style="background:#FEF9F0;border:1px solid #f59e0b;border-radius:10px;padding:16px 18px;text-align:center;"><div style="font-size:14px;font-weight:800;color:#92400e;margin-bottom:6px;">Site Blocked Crawlers</div><div style="font-size:12px;color:#6b7280;line-height:1.6;">We were unable to crawl <strong>' + eH(audit.domain) + '</strong>. The site likely uses Cloudflare or a similar security tool that blocks automated scans. We can audit it manually on our call.</div></div>'
+          : scoreBar('On-Page SEO', catScores.seoScore)
+          + scoreBar('Technical Health', catScores.techScore)
+          + scoreBar('Content Quality', catScores.contentScore)
+          + scoreBar('Link & Media Health', catScores.linkScore)
+          + scoreBar('Local SEO Setup', catScores.localSeoScore)}
+      </div>
+    </td></tr>`;
+  }
+
+  // ─── BUILD allFixes (used for Section 6 top-3 site fixes) ────────────
   const allFixes = [];
   if (audit) {
     const imap = {};
     (audit.topIssues || []).forEach(i => { imap[i.key] = i.count; });
     const fixDefs = [
-      { key: 'is_broken', sev: 'CRITICAL', label: 'Fix broken pages', detail: c => `${c} page${c>1?'s are':' is'} returning 404 errors. These damage user experience and directly hurt your rankings.` },
-      { key: 'is_4xx_code', sev: 'CRITICAL', label: 'Resolve 4xx error pages', detail: c => `${c} page${c>1?'s have':' has'} client-side errors. Google treats these as signs of a poorly maintained site.` },
-      { key: 'is_5xx_code', sev: 'CRITICAL', label: 'Fix server errors (5xx)', detail: c => `${c} page${c>1?'s are':' is'} showing server errors. This is a serious red flag for Google.` },
-      { key: 'has_no_title', sev: 'CRITICAL', label: 'Add a title to your web pages', detail: c => `${c} page${c>1?'s have':' has'} no title. Without it Google has no idea what the page is about.` },
-      { key: 'has_no_description', sev: 'HIGH', label: 'Add a description to your pages', detail: c => `${c} page${c>1?'s are':' is'} missing a description. Without it people skip past your listing in search results.` },
-      { key: 'has_no_h1_tags', sev: 'HIGH', label: 'Add a main headline to each page', detail: c => `${c} page${c>1?'s have':' has'} no main heading. Missing it hurts your rankings.` },
-      { key: 'has_duplicate_title', sev: 'HIGH', label: 'Fix duplicate page titles', detail: c => `${c} page${c>1?'s have':' has'} the same title as another page. Each page needs its own unique title.` },
-      { key: 'has_no_canonical', sev: 'HIGH', label: 'Add canonical tags to your pages', detail: c => `${c} page${c>1?'s are':' is'} missing a canonical tag. This prevents duplicate content from hurting rankings.` },
-      { key: 'has_no_micromarkup', sev: 'MED', label: 'Add schema markup to your site', detail: c => `${c} page${c>1?'s have':' has'} no structured data. Schema markup directly helps local rankings.` },
-      { key: 'has_no_image_alt', sev: 'MED', label: 'Describe your images for Google', detail: c => `${c} image${c>1?'s have':' has'} no description. This helps your site show up in Google Images too.` },
-      { key: 'is_http', sev: 'CRITICAL', label: 'Your site is not using HTTPS', detail: c => `${c} page${c>1?'s are':' is'} being served without SSL. Google marks HTTP sites as "Not Secure" and ranks them lower.` },
+      { key: 'is_broken',               sev: 'CRITICAL', label: 'Fix broken pages',                detail: c => `${c} page${c>1?'s are':' is'} returning 404 errors. These damage user experience, waste crawl budget, and directly hurt your rankings. Redirect or restore them immediately.` },
+      { key: 'is_4xx_code',             sev: 'CRITICAL', label: 'Resolve 4xx error pages',         detail: c => `${c} page${c>1?'s have':' has'} client-side errors. Google treats these as signs of a poorly maintained site and will deprioritize crawling your domain.` },
+      { key: 'is_5xx_code',             sev: 'CRITICAL', label: 'Fix server errors (5xx)',         detail: c => `${c} page${c>1?'s are':' is'} showing server errors. This is a serious red flag for Google. Fix your server configuration or hosting right away.` },
+      { key: 'has_no_title',            sev: 'CRITICAL', label: 'Add a title to your web pages',   detail: c => `${c} page${c>1?'s have':' has'} no title. Google uses this to decide what your page is about. Without it Google has no idea what the page is about.` },
+      { key: 'has_no_description',      sev: 'HIGH',     label: 'Add a description to your pages', detail: c => `${c} page${c>1?'s are':' is'} missing a description. This is the text people see in Google search results before deciding to click. Without it people skip past your listing in search results.` },
+      { key: 'has_no_h1_tags',          sev: 'HIGH',     label: 'Add a main headline to each page', detail: c => `${c} page${c>1?'s have':' has'} no main heading. Google looks for this to understand what the page is about. Missing it hurts your rankings.` },
+      { key: 'has_duplicate_title',     sev: 'HIGH',     label: 'Fix duplicate page titles',        detail: c => `${c} page${c>1?'s have':' has'} the same title as another page. Google gets confused which one to show. Each page needs its own unique title.` },
+      { key: 'has_duplicate_description', sev: 'MED',    label: 'Give each page a unique description', detail: c => `${c} page${c>1?'s use':' uses'} the same description as another page. Each page should have its own description so Google knows what makes it different.` },
+      { key: 'has_redirect_chain',      sev: 'MED',      label: 'Fix redirect loops on your site',  detail: c => `${c} page${c>1?'s bounce':' bounces'} visitors through multiple redirects before loading. This slows your site and wastes Google's crawl time.` },
+      { key: 'has_no_image_alt',        sev: 'MED',      label: 'Describe your images for Google',  detail: c => `${c} image${c>1?'s have':' has'} no description. Google can't see pictures — you have to tell it what they show. This also helps your site show up in Google Images.` },
+      { key: 'has_multiple_h1_tags',    sev: 'LOW',      label: 'Fix pages with too many main headlines', detail: c => `${c} page${c>1?'s have':' has'} more than one main headline. Each page should have exactly one. It confuses Google about what the page is really about.` },
+      { key: 'has_no_content_encoding', sev: 'LOW',      label: 'Speed up your website',            detail: c => `${c} page${c>1?'s are':' is'} loading slower than they need to. Faster sites rank higher and keep visitors from leaving before the page loads.` },
+      { key: 'has_no_canonical',        sev: 'HIGH',     label: 'Add canonical tags to your pages', detail: c => `${c} page${c>1?'s are':' is'} missing a canonical tag. This tells Google which version of a page is the "official" one and prevents duplicate content from hurting your rankings.` },
+      { key: 'has_no_micromarkup',      sev: 'MED',      label: 'Add schema markup to your site',   detail: c => `${c} page${c>1?'s have':' has'} no structured data. Schema markup tells Google exactly what your business does, where you are, and what services you offer. It directly helps local rankings.` },
+      { key: 'has_no_og_tags',          sev: 'LOW',      label: 'Add social sharing tags',          detail: c => `${c} page${c>1?'s are':' are'} missing Open Graph tags. These control how your site looks when someone shares it on Facebook or LinkedIn. A missing image or title looks unprofessional.` },
+      { key: 'has_mixed_content',       sev: 'HIGH',     label: 'Fix mixed content warnings',       detail: c => `${c} page${c>1?'s load':' loads'} some resources over HTTP on an HTTPS page. Browsers flag this as a security issue and it can break your site for some visitors.` },
+      { key: 'is_http',                 sev: 'CRITICAL', label: 'Your site is not using HTTPS',     detail: c => `${c} page${c>1?'s are':' is'} being served without SSL. Google marks HTTP sites as "Not Secure" in browsers and ranks them lower than HTTPS sites. This is a major red flag for customers.` },
     ];
-    fixDefs.forEach(def => { if (imap[def.key] > 0) allFixes.push({ source: 'website', sev: def.sev, label: def.label, detail: def.detail(imap[def.key]), count: imap[def.key], key: def.key }); });
-    if (audit.hasSSL === false && !audit.crawlBlocked) allFixes.unshift({ source: 'website', sev: 'CRITICAL', label: 'Switch your site to HTTPS', detail: 'Your site is running on HTTP, not HTTPS. Google marks these as "Not Secure" and ranks them lower.' });
-    if (audit.hasSitemap === false && audit.totalPages > 3) allFixes.push({ source: 'website', sev: 'HIGH', label: 'Create a sitemap.xml', detail: 'A sitemap tells Google every page on your site. Without one, some pages may never get indexed.' });
-    if (audit.hasRobots === false) allFixes.push({ source: 'website', sev: 'HIGH', label: 'Add a robots.txt file', detail: 'Without robots.txt, Google has to guess how to crawl your site and might miss pages.' });
+    fixDefs.forEach(def => {
+      if (imap[def.key] && imap[def.key] > 0) {
+        allFixes.push({ source: 'website', sev: def.sev, label: def.label, detail: def.detail(imap[def.key]), count: imap[def.key], key: def.key });
+      }
+    });
+    // Site-level checks
+    if (audit.hasSSL === false && !audit.crawlBlocked) {
+      allFixes.unshift({ source: 'website', sev: 'CRITICAL', label: 'Switch your site to HTTPS', detail: 'Your site is running on HTTP, not HTTPS. Google marks these sites as "Not Secure" and ranks them lower. Most hosting providers can add an SSL certificate for free in minutes.' });
+    }
+    if (audit.hasSitemap === false && audit.totalPages > 3) {
+      allFixes.push({ source: 'website', sev: 'HIGH', label: 'Create a sitemap.xml', detail: 'Your website has no sitemap. A sitemap tells Google every page that exists on your site. Without one, some pages may never get indexed and won\'t show up in search.' });
+    }
+    if (audit.hasRobots === false) {
+      allFixes.push({ source: 'website', sev: 'HIGH', label: 'Add a robots.txt file', detail: 'Your site has no robots.txt file. This file tells Google how to crawl your site. Without it, Google has to guess — and might miss pages or waste time crawling ones that don\'t matter.' });
+    }
+    const noindexThreshold = Math.max(1, Math.floor(audit.totalPages * 0.15));
+    if (audit.noindexPages > noindexThreshold) {
+      allFixes.push({ source: 'website', sev: 'HIGH', label: `${audit.noindexPages} page${audit.noindexPages > 1 ? 's are' : ' is'} hidden from Google`, detail: `${audit.noindexPages} page${audit.noindexPages > 1 ? 's have' : ' has'} a noindex tag, which tells Google not to show them in search results. This is often set by accident in website builders. Check whether these pages should be visible.` });
+    }
+    if (audit.thinContent > 0) {
+      allFixes.push({ source: 'website', sev: 'MED', label: `${audit.thinContent} page${audit.thinContent > 1 ? 's have' : ' has'} almost no content`, detail: `${audit.thinContent} page${audit.thinContent > 1 ? 's have' : ' has'} fewer than 200 words. Google skips thin pages in local search. Add real content describing your services, your service area, and why customers should choose you.` });
+    }
+    if (audit.missingCanonical > 0 && !allFixes.some(f => f.key === 'has_no_canonical')) {
+      allFixes.push({ source: 'website', sev: 'HIGH', label: 'Add canonical tags to your pages', detail: `${audit.missingCanonical} page${audit.missingCanonical > 1 ? 's are' : ' is'} missing a canonical tag. This tells Google which version of a page is the official one and prevents duplicate content from splitting your rankings.` });
+    }
+    if (audit.missingSchema > 0 && !allFixes.some(f => f.key === 'has_no_micromarkup')) {
+      allFixes.push({ source: 'website', sev: 'MED', label: 'Add schema markup to your site', detail: `${audit.missingSchema} page${audit.missingSchema > 1 ? 's have' : ' has'} no structured data. Schema tells Google exactly what your business does and where you are. It directly helps local pack rankings.` });
+    }
+    if (audit.mixedContent > 0 && !allFixes.some(f => f.key === 'has_mixed_content')) {
+      allFixes.push({ source: 'website', sev: 'HIGH', label: 'Fix mixed content warnings', detail: `${audit.mixedContent} page${audit.mixedContent > 1 ? 's load' : ' loads'} some resources over HTTP on an HTTPS page. Browsers flag this as a security warning and it can break things for some visitors.` });
+    }
   }
-  if (invisCount > sd.pts.length * 0.4) allFixes.push({ source: 'local', sev: 'CRITICAL', label: 'Tell Google where you actually work', detail: `You're not showing up in ${invisCount} of ${sd.pts.length} areas. Add every city and zip you serve to your Google Business Profile.` });
-  if ((top3Count / sd.pts.length) < 0.3) allFixes.push({ source: 'local', sev: 'HIGH', label: 'Get more Google reviews', detail: `You're only in the top 3 in ${top3Count} of ${sd.pts.length} areas. Reviews are the #1 thing Google uses to rank local businesses.` });
-
   const sevOrder = { CRITICAL: 0, HIGH: 1, MED: 2, LOW: 3 };
   allFixes.sort((a, b) => sevOrder[a.sev] - sevOrder[b.sev]);
   const sevColors = { CRITICAL: '#ef4444', HIGH: '#f59e0b', MED: '#F06478', LOW: '#6b7280' };
   const sevBg     = { CRITICAL: '#fee2e2', HIGH: '#fef3c7', MED: '#e6f7f6', LOW: '#f3f4f6' };
-  const sourceIcon = (s) => s === 'local'
-    ? `<span style="font-size:8px;font-weight:800;color:#D94060;background:#FAE8E0;padding:2px 6px;border-radius:6px;letter-spacing:.03em;">LOCAL</span>`
-    : `<span style="font-size:8px;font-weight:800;color:#D94060;background:#FAE8E0;padding:2px 6px;border-radius:6px;letter-spacing:.03em;">SITE</span>`;
-  const topFixesSection = `<tr><td style="background:#FAF7F4;padding:14px 28px 20px;">
-    ${allFixes.length === 0 ? `<div style="text-align:center;padding:24px;background:#f0fdf9;border:1px solid #bbf7d0;border-radius:12px;"><div style="font-size:24px;margin-bottom:8px;">🎉</div><div style="font-size:14px;font-weight:700;color:#166534;">No critical fixes needed</div></div>` : ''}
-    ${allFixes.slice(0, 10).map((fix, i) => `
-    <div style="display:flex;gap:12px;margin-bottom:10px;padding:12px 14px;background:#ffffff;border:1px solid #EDD8D0;border-radius:10px;border-left:4px solid ${sevColors[fix.sev]};">
-      <div style="flex-shrink:0;font-family:monospace;font-size:12px;font-weight:900;color:${sevColors[fix.sev]};width:20px;text-align:center;padding-top:1px;">${i + 1}</div>
-      <div style="flex:1;">
-        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
-          <span>${sourceIcon(fix.source)}</span>
-          <span style="font-size:12px;font-weight:800;color:#1a1a2e;">${fix.label}</span>
-          <span style="font-size:9px;font-weight:800;color:${sevColors[fix.sev]};background:${sevBg[fix.sev]};padding:2px 6px;border-radius:8px;flex-shrink:0;">${fix.sev}</span>
-        </div>
-        <div style="font-size:10px;color:#6b7280;line-height:1.6;">${fix.detail}</div>
-      </div>
-    </div>`).join('')}
+
+  // ─── SECTION 6: TOP WEBSITE FIXES (top 3 site issues only) ──────────
+  let topSiteFixes = [];
+  if (audit && catScores && !catScores.blocked) {
+    topSiteFixes = allFixes.filter(f => f.source === 'website').slice(0, 3);
+  }
+  const topSiteFixesSection = topSiteFixes.length === 0 ? '' : `<tr><td style="background:#FAF7F4;padding:14px 28px 18px;">
+    ${topSiteFixes.map((fix, i) => `
+    <table cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:${i < topSiteFixes.length - 1 ? '10px' : '0'};">
+    <tr>
+      <td style="width:4px;background:${sevColors[fix.sev]};border-radius:4px 0 0 4px;vertical-align:top;padding:0;">&nbsp;</td>
+      <td style="background:#ffffff;border:1px solid #EDD8D0;border-left:none;border-radius:0 10px 10px 0;padding:12px 14px;vertical-align:top;">
+        <table cellpadding="0" cellspacing="0" width="100%"><tr>
+          <td style="vertical-align:middle;">
+            <span style="font-size:12px;font-weight:900;color:#1a1a2e;">${fix.label}</span>
+          </td>
+          <td style="text-align:right;white-space:nowrap;vertical-align:middle;">
+            <span style="font-size:8px;font-weight:800;color:${sevColors[fix.sev]};background:${sevBg[fix.sev]};padding:3px 8px;border-radius:8px;">${fix.sev}</span>
+            ${fix.count ? `<span style="font-size:10px;font-weight:700;color:#9ca3af;margin-left:6px;">${fix.count} page${fix.count > 1 ? 's' : ''}</span>` : ''}
+          </td>
+        </tr></table>
+        <div style="font-size:10px;color:#6b7280;line-height:1.55;margin-top:5px;">${fix.detail}</div>
+      </td>
+    </tr>
+    </table>`).join('')}
   </td></tr>`;
 
-  // ASSEMBLE
+  // ─── ASSEMBLE FULL EMAIL ────────────────────────────────────────────
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>${eH(sd.biz)} — Google Maps & Website Report</title></head>
 <body style="margin:0;padding:0;background:#FAF7F4;font-family:system-ui,-apple-system,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#FAF7F4;padding:24px 0;"><tr><td>
 <table width="640" cellpadding="0" cellspacing="0" align="center" style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 4px 40px rgba(15,15,26,.12);">
 
+<!-- HEADER -->
 <tr><td style="background:linear-gradient(135deg,#0f0f1a,#1a1a2e,#252540);padding:24px 32px 22px;position:relative;">
   <div style="position:absolute;bottom:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#F06478,#e8855a,#5BC4D0);"></div>
   <table cellpadding="0" cellspacing="0" style="margin-bottom:16px;"><tr>
@@ -1273,53 +1418,85 @@ function buildReportEmail(sd, audit, sections, prospectName) {
   </tr></table>
   <div style="font-size:26px;font-weight:900;color:#ffffff;line-height:1.15;margin-bottom:4px;">${eH(sd.biz)}</div>
   <div style="font-size:12px;color:rgba(255,255,255,.45);margin-bottom:16px;">${eH(sd.addr || '')}</div>
+  <div style="display:flex;gap:7px;flex-wrap:wrap;">
+    <span style="background:rgba(240,100,120,.2);border:1px solid rgba(240,100,120,.35);color:#F06478;padding:3px 11px;border-radius:20px;font-size:9px;font-weight:800;letter-spacing:.04em;">LOCAL GRID SCAN</span>
+    ${audit ? `<span style="background:rgba(240,100,120,.2);border:1px solid rgba(240,100,120,.35);color:#F06478;padding:3px 11px;border-radius:20px;font-size:9px;font-weight:800;letter-spacing:.04em;">WEBSITE AUDIT</span>` : ''}
+    <span style="background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);color:rgba(255,255,255,.5);padding:3px 11px;border-radius:20px;font-size:9px;">${sd.kws.length} keyword${sd.kws.length>1?'s':''} · ${sd.pts.length} areas · ${sd.rad} mi radius</span>
+  </div>
 </td></tr>
 
+<!-- GREETING -->
 <tr><td style="background:#fff;padding:16px 28px;border-bottom:2px solid #FAF7F4;">
   <p style="font-size:13px;color:#374151;line-height:1.7;margin:0;">Hi ${eH(prospectName || 'there')}, we pulled your Google Maps rankings and ran a quick audit of your website. Here's exactly where you stand and what's holding you back.</p>
 </td></tr>
 
-${sectionHeader('Your Google Snapshot', '01', '')}
-${execSummary}
+${sectionHeader('Your Google Snapshot', '01')}
+${execSummarySection}
 
-${sectionHeader('Where You Show Up on Google Maps', '02', '')}
+${videoBridgeSection}
+
+${sectionHeader('Where You Show Up on Google Maps', '02')}
 ${sections.kwSection}
 
-${sectionHeader("What's Hurting Your Rankings", '03', '')}
-${sections.stratSection}
+${sectionHeader("What's Hurting Your Rankings", '03')}
+${strategicSection}
 
-${sectionHeader("Who's Beating You Right Now", '04', '')}
+${sectionHeader("Who's Beating You Right Now", '04')}
 ${sections.compSection}
 
-${audit && catScores && !catScores.blocked ? `${sectionHeader('Your Website Health Check', '05', '')}
-<tr><td style="background:#ffffff;padding:8px 32px 24px;">
-  <div style="padding:16px 20px;background:#fff;border:1px solid #e8dede;border-radius:12px;">
-    ${scoreBar('On-Page SEO', catScores.seoScore)}
-    ${scoreBar('Technical Health', catScores.techScore)}
-    ${scoreBar('Content Quality', catScores.contentScore)}
-    ${scoreBar('Link & Media Health', catScores.linkScore)}
-    ${scoreBar('Local SEO Setup', catScores.localSeoScore)}
-  </div>
-</td></tr>` : ''}
+${audit ? `${sectionHeader('Your Website Health Check', '05')}
+${auditScoresSection}` : ''}
 
-${sectionHeader('Top Fixes', '06', '')}
-${topFixesSection}
+${topSiteFixesSection ? `${sectionHeader("Website Fixes That'll Move the Needle", '06')}
+${topSiteFixesSection}` : ''}
 
+<!-- CTA -->
 <tr><td style="background:#fff;padding:8px 32px 36px;">
+  <div style="background:#F2EDE8;border:1px solid #EDD8D0;border-radius:12px;padding:16px 20px;margin-bottom:14px;">
+    <div>
+      <div style="font-size:12px;font-weight:800;color:#1a1a2e;margin-bottom:3px;">Croc's &amp; Clicks — Vancouver, WA</div>
+      <div style="font-size:11px;color:#6b7280;">Full-service marketing agency serving local businesses across the Pacific Northwest.</div>
+    </div>
+  </div>
+
   <div style="background:linear-gradient(135deg,#1a1a2e 0%,#1a1a2e 50%,#1a1a2e 100%);border-radius:14px;padding:28px 30px;text-align:center;position:relative;overflow:hidden;">
     <div style="position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#F06478,#e8855a,#5BC4D0);"></div>
+    <div style="font-size:11px;font-weight:800;color:rgba(255,255,255,.45);text-transform:uppercase;letter-spacing:.12em;margin-bottom:10px;">No sales pitch. No contract required.</div>
     <div style="font-size:19px;font-weight:900;color:#fff;margin-bottom:12px;line-height:1.35;">Let's talk through this and put together<br>a plan that actually gets you more calls</div>
+
+    <table cellpadding="0" cellspacing="0" style="margin:18px auto 22px;">
+      <tr>
+        <td style="padding:8px 16px;border-right:1px solid rgba(255,255,255,.12);vertical-align:middle;">
+          <span style="font-size:12px;color:#4ade80;font-weight:900;">✓</span>
+          <span style="font-size:11px;color:rgba(255,255,255,.9);font-weight:700;white-space:nowrap;"> No sales script</span>
+        </td>
+        <td style="padding:8px 16px;border-right:1px solid rgba(255,255,255,.12);vertical-align:middle;">
+          <span style="font-size:12px;color:#4ade80;font-weight:900;">✓</span>
+          <span style="font-size:11px;color:rgba(255,255,255,.9);font-weight:700;white-space:nowrap;"> No obligation</span>
+        </td>
+        <td style="padding:8px 16px;vertical-align:middle;">
+          <span style="font-size:12px;color:#4ade80;font-weight:900;">✓</span>
+          <span style="font-size:11px;color:rgba(255,255,255,.9);font-weight:700;white-space:nowrap;"> Locally owned</span>
+        </td>
+      </tr>
+    </table>
+
     <a href="https://crocsandclicks.com/contact" style="display:inline-block;background:linear-gradient(135deg,#F06478,#D94060);color:#fff;font-weight:900;font-size:14px;padding:14px 40px;border-radius:10px;text-decoration:none;letter-spacing:.01em;box-shadow:0 4px 20px rgba(240,100,120,.4);">Book a Free 20-Minute Call →</a>
     <div style="margin-top:14px;font-size:10px;color:rgba(255,255,255,.35);">We're based in Vancouver, WA — usually respond within a few hours</div>
   </div>
 </td></tr>
 
+<!-- FOOTER -->
 <tr><td style="background:#0f0f1a;padding:20px 32px;text-align:center;">
   <div style="font-size:11px;color:rgba(255,255,255,.25);line-height:1.8;">
     <div style="color:rgba(255,255,255,.45);font-weight:700;margin-bottom:4px;">Croc's &amp; Clicks — Full-Service Marketing Agency</div>
     <div>Vancouver, WA &nbsp;·&nbsp; <a href="https://crocsandclicks.com" target="_blank" style="color:rgba(255,255,255,.45);text-decoration:none;">crocsandclicks.com</a> &nbsp;·&nbsp; <a href="mailto:ben@crocsandclicks.com" style="color:rgba(255,255,255,.45);text-decoration:none;">ben@crocsandclicks.com</a></div>
-    <div style="margin-top:8px;font-size:10px;">Report generated ${date} &nbsp;·&nbsp; ${sd.pts.length} grid points scanned</div>
-    <div style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);font-size:10px;color:rgba(255,255,255,.2);">We sent this because we ran your Google Maps rankings and wanted to share what we found.<br><a href="mailto:ben@crocsandclicks.com?subject=Unsubscribe&body=Please remove ${eH(sd.biz)} from your mailing list." style="color:rgba(255,255,255,.3);text-decoration:underline;">Unsubscribe</a></div>
+    <div style="margin-top:8px;font-size:10px;">Report generated ${date} &nbsp;·&nbsp; Data reflects live Google Maps rankings &nbsp;·&nbsp; ${sd.pts.length} grid points scanned</div>
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);font-size:10px;color:rgba(255,255,255,.2);">
+      We sent this because we ran your Google Maps rankings and wanted to share what we found. We only reach out to local businesses in the Clark County / Portland area.<br>
+      Croc's &amp; Clicks &nbsp;·&nbsp; 1660 D St, Vancouver, WA 98663 &nbsp;·&nbsp; United States<br>
+      <a href="mailto:ben@crocsandclicks.com?subject=Unsubscribe&body=Please remove ${eH(sd.biz)} from your mailing list." style="color:rgba(255,255,255,.3);text-decoration:underline;">Unsubscribe</a>
+    </div>
   </div>
 </td></tr>
 
