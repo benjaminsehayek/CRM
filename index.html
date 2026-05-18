@@ -44,7 +44,14 @@ const SUPABASE_ANON_KEY = 'sb_publishable_L5Hb-qqsAcN6RLhkdTwYPA_hxPogZiT';
 // (APIs & Services → Credentials → OAuth 2.0 Client IDs → Web application).
 // Leave blank until set; the Calendar feature will show a setup notice.
 const GOOGLE_CLIENT_ID = '694944470306-v7hetbgag0bj2fn29lbsm27juqtl4ijp.apps.googleusercontent.com';
-const GOOGLE_CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+// Space-separated list of OAuth scopes. Adding a new scope here requires every
+// rep to re-consent on next sign-in.
+const GOOGLE_OAUTH_SCOPES = [
+  'https://www.googleapis.com/auth/calendar.events',
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/gmail.readonly',
+].join(' ');
+const GOOGLE_CALENDAR_SCOPE = GOOGLE_OAUTH_SCOPES; // legacy alias
 
 // Twilio Voice — the Supabase Edge Function that mints access tokens and
 // brokers Twilio's webhook callbacks.
@@ -348,6 +355,112 @@ const gcal = {
 };
 
 /* =====================================================================
+   GMAIL — reuses the same Google OAuth token as gcal (one consent grants
+   both calendar.events + gmail.send + gmail.readonly).
+   ===================================================================== */
+const gmail = {
+  // base64url encoding for the raw RFC2822 message body
+  encodeRaw(str) {
+    // UTF-8 safe encoding via TextEncoder, then base64url
+    const bytes = new TextEncoder().encode(str);
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  },
+
+  buildRawMessage({ to, from, subject, body, replyToMessageId, references }) {
+    const headers = [
+      `To: ${to}`,
+      from ? `From: ${from}` : null,
+      `Subject: ${subject || '(no subject)'}`,
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=UTF-8',
+      replyToMessageId ? `In-Reply-To: <${replyToMessageId}>` : null,
+      references ? `References: <${references}>` : null,
+    ].filter(Boolean).join('\r\n');
+    return this.encodeRaw(`${headers}\r\n\r\n${body || ''}`);
+  },
+
+  async apiFetch(path, { method = 'GET', body = null, query = null } = {}) {
+    const token = await gcal.getAccessToken();
+    const url = new URL('https://gmail.googleapis.com/gmail/v1' + path);
+    if (query) Object.entries(query).forEach(([k, v]) => v != null && url.searchParams.append(k, v));
+    const res = await fetch(url.toString(), {
+      method,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : null,
+    });
+    if (res.status === 401) {
+      gcal.clearToken();
+      throw new Error('Google session expired — click Reconnect Google.');
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Gmail API error ${res.status}`);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  },
+
+  // Send a new email or a reply if threadId is provided.
+  async send({ to, subject, body, threadId = null, replyToMessageId = null }) {
+    const raw = this.buildRawMessage({
+      to, subject, body, replyToMessageId, references: replyToMessageId,
+    });
+    return this.apiFetch('/users/me/messages/send', {
+      method: 'POST',
+      body: threadId ? { raw, threadId } : { raw },
+    });
+  },
+
+  // Fetch all messages in a thread; returns parsed headers + bodies.
+  async getThread(threadId) {
+    const data = await this.apiFetch(`/users/me/threads/${threadId}`, {
+      query: { format: 'full' },
+    });
+    const messages = (data.messages || []).map(m => this.parseMessage(m));
+    return { id: data.id, messages };
+  },
+
+  // Pull a Gmail message into a simple shape: { id, threadId, from, to, subject, snippet, body, internalDate }
+  parseMessage(msg) {
+    const headers = Object.fromEntries((msg.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
+    return {
+      id: msg.id,
+      threadId: msg.threadId,
+      from: headers.from || '',
+      to: headers.to || '',
+      subject: headers.subject || '',
+      snippet: msg.snippet || '',
+      body: this.extractBody(msg.payload),
+      internalDate: msg.internalDate ? new Date(parseInt(msg.internalDate, 10)) : null,
+    };
+  },
+
+  extractBody(payload) {
+    if (!payload) return '';
+    if (payload.body?.data) {
+      try { return this.decodeBase64Url(payload.body.data); } catch { return ''; }
+    }
+    for (const part of (payload.parts || [])) {
+      if (part.mimeType === 'text/plain' && part.body?.data) {
+        try { return this.decodeBase64Url(part.body.data); } catch {}
+      }
+    }
+    for (const part of (payload.parts || [])) {
+      const nested = this.extractBody(part);
+      if (nested) return nested;
+    }
+    return '';
+  },
+
+  decodeBase64Url(s) {
+    const padded = s.replace(/-/g, '+').replace(/_/g, '/');
+    return new TextDecoder('utf-8').decode(Uint8Array.from(atob(padded + '==='.slice((padded.length + 3) % 4)), c => c.charCodeAt(0)));
+  },
+};
+
+/* =====================================================================
    APP STATE — Context + useReducer
    ===================================================================== */
 const { useState, useEffect, useMemo, useReducer, useRef, useCallback, createContext, useContext } = React;
@@ -397,13 +510,13 @@ const initialState = {
   taskSort: { field: 'due_at', dir: 'asc' },
   taskSelectedIds: [],
 
-  // Calls tab — master list across all accounts
-  allCalls: [],
-  callFilters: {
-    users: [], directions: [], statuses: [], dateRange: 'any', search: '',
+  // Activity tab — unified master list across all accounts (calls + activities table)
+  allActivities: [],
+  activityFilters: {
+    users: [], types: [], dateRange: 'any', search: '',
   },
-  callSort: { field: 'started_at', dir: 'desc' },
-  callSelectedIds: [],
+  activitySort: { field: 'occurred_at', dir: 'desc' },
+  allCalls: [],
 
   // Twilio Voice — Device status (Device instance itself lives in a ref).
   twilio: { status: 'idle', error: null },  // idle | registering | ready | error
@@ -414,7 +527,7 @@ function parseHash(hash) {
   if (!h || h === 'accounts') return { name: 'list', tab: 'accounts' };
   if (h === 'contacts') return { name: 'list', tab: 'contacts' };
   if (h === 'tasks') return { name: 'list', tab: 'tasks' };
-  if (h === 'calls') return { name: 'list', tab: 'calls' };
+  if (h === 'activity' || h === 'calls') return { name: 'list', tab: 'activity' };
   if (h === 'calendar') return { name: 'calendar' };
   const m = h.match(/^accounts\/([0-9a-fA-F-]{36})$/);
   if (m) return { name: 'detail', accountId: m[1] };
@@ -465,7 +578,11 @@ function appReducer(state, action) {
     }
     case 'ADD_ACTIVITY': {
       const arr = state.activities[action.activity.account_id] || [];
-      return { ...state, activities: { ...state.activities, [action.activity.account_id]: [action.activity, ...arr] } };
+      return {
+        ...state,
+        activities: { ...state.activities, [action.activity.account_id]: [action.activity, ...arr] },
+        allActivities: [action.activity, ...state.allActivities],
+      };
     }
     case 'SET_SAVED_VIEWS':  return { ...state, savedViews: action.views };
     case 'SET_ROUTE':        return { ...state, route: action.route };
@@ -520,16 +637,18 @@ function appReducer(state, action) {
       return { ...state, allCalls: next };
     }
     case 'REMOVE_CALL': return { ...state, allCalls: state.allCalls.filter(c => c.id !== action.id) };
-    case 'SET_CALL_FILTERS':   return { ...state, callFilters: { ...state.callFilters, ...action.filters } };
-    case 'RESET_CALL_FILTERS': return { ...state, callFilters: initialState.callFilters };
-    case 'SET_CALL_SORT':      return { ...state, callSort: action.sort };
-    case 'TOGGLE_CALL_SELECT': {
-      const has = state.callSelectedIds.includes(action.id);
-      return { ...state, callSelectedIds: has ? state.callSelectedIds.filter(x => x !== action.id) : [...state.callSelectedIds, action.id] };
+
+    case 'SET_ALL_ACTIVITIES': return { ...state, allActivities: action.activities };
+    case 'UPSERT_ALL_ACTIVITY': {
+      const i = state.allActivities.findIndex(a => a.id === action.activity.id);
+      const next = state.allActivities.slice();
+      if (i >= 0) next[i] = { ...next[i], ...action.activity };
+      else next.unshift(action.activity);
+      return { ...state, allActivities: next };
     }
-    case 'SET_CALL_SELECTION':   return { ...state, callSelectedIds: action.ids };
-    case 'CLEAR_CALL_SELECTION': return { ...state, callSelectedIds: [] };
-    case 'APPLY_CALL_VIEW':      return { ...state, callFilters: { ...initialState.callFilters, ...action.filters }, callSort: action.sort || state.callSort };
+    case 'SET_ACTIVITY_FILTERS':   return { ...state, activityFilters: { ...state.activityFilters, ...action.filters } };
+    case 'RESET_ACTIVITY_FILTERS': return { ...state, activityFilters: initialState.activityFilters };
+    case 'SET_ACTIVITY_SORT':      return { ...state, activitySort: action.sort };
 
     case 'SET_TWILIO': return { ...state, twilio: { ...state.twilio, ...action.twilio } };
 
@@ -1147,7 +1266,7 @@ function ListTabSwitcher() {
         { key: 'accounts', label: 'Accounts' },
         { key: 'contacts', label: 'Contacts' },
         { key: 'tasks',    label: 'Tasks' },
-        { key: 'calls',    label: 'Calls' },
+        { key: 'activity', label: 'Activity' },
       ].map(t => (
         <button key={t.key}
           onClick={() => { window.location.hash = `#/${t.key}`; }}
@@ -1875,7 +1994,7 @@ function TaskListView() {
 }
 
 /* =====================================================================
-   CALLS — shared atoms used by both master list and account sub-tab
+   ACTIVITY — unified feed of calls + activities (emails, notes, meetings, etc.)
    ===================================================================== */
 const CALL_STATUSES = [
   { value: 'queued',      label: 'Queued',      cls: 'bg-gray-100 text-gray-700' },
@@ -1887,11 +2006,6 @@ const CALL_STATUSES = [
   { value: 'failed',      label: 'Failed',      cls: 'bg-red-100 text-red-800' },
   { value: 'voicemail',   label: 'Voicemail',   cls: 'bg-purple-100 text-purple-800' },
   { value: 'canceled',    label: 'Canceled',    cls: 'bg-gray-100 text-gray-600' },
-];
-
-const CALL_DIRECTIONS = [
-  { value: 'outbound', label: 'Outbound' },
-  { value: 'inbound',  label: 'Inbound' },
 ];
 
 function CallStatusPill({ value }) {
@@ -1906,7 +2020,38 @@ function fmtCallDuration(sec) {
   return `${m}m ${s}s`;
 }
 
-function applyCallFilters(calls, f) {
+// Map a calls-table row or activities-table row into a unified event shape.
+function callToEvent(c) {
+  return {
+    kind: 'call',
+    id: 'call-' + c.id,
+    raw: c,
+    account_id: c.account_id,
+    contact_id: c.contact_id,
+    user_id: c.user_id,
+    occurred_at: c.started_at,
+    type: 'call',
+    direction: c.direction,
+  };
+}
+function activityToEvent(a) {
+  return {
+    kind: 'activity',
+    id: 'act-' + a.id,
+    raw: a,
+    account_id: a.account_id,
+    contact_id: a.contact_id,
+    user_id: a.user_id,
+    occurred_at: a.occurred_at,
+    type: a.type,
+    direction: null,
+  };
+}
+function mergeEvents(calls, activities) {
+  return [...calls.map(callToEvent), ...activities.map(activityToEvent)];
+}
+
+function applyActivityFilters(events, f) {
   const search = (f.search || '').trim().toLowerCase();
   const now = new Date();
   const cutoff = (() => {
@@ -1915,35 +2060,36 @@ function applyCallFilters(calls, f) {
     if (f.dateRange === 'month') return new Date(now.getFullYear(), now.getMonth(), 1);
     return null;
   })();
-  return calls.filter(c => {
-    if (f.users.length && !f.users.includes(c.user_id)) return false;
-    if (f.directions.length && !f.directions.includes(c.direction)) return false;
-    if (f.statuses.length && (!c.status || !f.statuses.includes(c.status))) return false;
-    if (cutoff && new Date(c.started_at) < cutoff) return false;
+  return events.filter(ev => {
+    if (f.users.length && !f.users.includes(ev.user_id)) return false;
+    if (f.types.length && !f.types.includes(ev.type)) return false;
+    if (cutoff && new Date(ev.occurred_at) < cutoff) return false;
     if (search) {
-      const hay = [c.from_number, c.to_number, c.notes, c.voicemail_transcription].map(x => (x || '').toLowerCase()).join(' ');
-      if (!hay.includes(search)) return false;
+      const r = ev.raw;
+      const hay = ev.kind === 'call'
+        ? [r.from_number, r.to_number, r.notes, r.voicemail_transcription]
+        : [r.subject, r.body, r.email_to, r.email_from, r.email_subject];
+      const joined = hay.map(x => (x || '').toLowerCase()).join(' ');
+      if (!joined.includes(search)) return false;
     }
     return true;
   });
 }
 
-function applyCallSort(calls, accounts, profiles, sort) {
+function applyActivitySort(events, accounts, profiles, sort) {
   const acctMap = Object.fromEntries(accounts.map(a => [a.id, a]));
   const profileMap = Object.fromEntries(profiles.map(p => [p.id, p]));
   const k = sort.dir === 'asc' ? 1 : -1;
-  const get = (c) => {
+  const get = (ev) => {
     switch (sort.field) {
-      case 'account':    return (acctMap[c.account_id]?.name || '').toLowerCase();
-      case 'user':       return (profileMap[c.user_id]?.full_name || '').toLowerCase();
-      case 'direction':  return c.direction || '';
-      case 'duration':   return c.duration_seconds || 0;
-      case 'status':     return c.status || '';
-      case 'started_at':
-      default:           return c.started_at || '';
+      case 'account':    return (acctMap[ev.account_id]?.name || '').toLowerCase();
+      case 'user':       return (profileMap[ev.user_id]?.full_name || '').toLowerCase();
+      case 'type':       return ev.type || '';
+      case 'occurred_at':
+      default:           return ev.occurred_at || '';
     }
   };
-  return calls.slice().sort((a,b) => {
+  return events.slice().sort((a,b) => {
     const av = get(a), bv = get(b);
     if (av < bv) return -1 * k;
     if (av > bv) return 1 * k;
@@ -1951,24 +2097,23 @@ function applyCallSort(calls, accounts, profiles, sort) {
   });
 }
 
-function CallFilterPanel() {
+function ActivityFilterPanel() {
   const { state, dispatch } = useApp();
   const [open, setOpen] = useState(true);
-  const f = state.callFilters;
-  const set = (patch) => dispatch({ type: 'SET_CALL_FILTERS', filters: patch });
+  const f = state.activityFilters;
+  const set = (patch) => dispatch({ type: 'SET_ACTIVITY_FILTERS', filters: patch });
 
   return (
     <div className={classNames('border-r border-gray-200 bg-white transition-all', open ? 'w-72' : 'w-10')}>
       <div className="flex items-center justify-between p-2 border-b border-gray-200">
         <button onClick={() => setOpen(o => !o)} className="text-sm font-medium text-gray-700">{open ? 'Filters' : '☰'}</button>
         {open && (
-          <button onClick={() => dispatch({ type: 'RESET_CALL_FILTERS' })} className="text-xs text-blue-600 hover:underline">Reset</button>
+          <button onClick={() => dispatch({ type: 'RESET_ACTIVITY_FILTERS' })} className="text-xs text-blue-600 hover:underline">Reset</button>
         )}
       </div>
       {open && (
         <div className="p-3 space-y-3 overflow-y-auto scrollbar-thin" style={{ height: 'calc(100vh - 130px)' }}>
-          <MultiCheckGroup label="Direction" options={CALL_DIRECTIONS} values={f.directions} onChange={v => set({ directions: v })} />
-          <MultiCheckGroup label="Status" options={CALL_STATUSES} values={f.statuses} onChange={v => set({ statuses: v })} />
+          <MultiCheckGroup label="Type" options={ACTIVITY_TYPES} values={f.types} onChange={v => set({ types: v })} />
           <MultiCheckGroup label="Rep" options={state.profiles.map(p => ({ value: p.id, label: p.full_name }))} values={f.users} onChange={v => set({ users: v })} />
           <Select label="Date range" value={f.dateRange} onChange={e => set({ dateRange: e.target.value })}
                   options={[
@@ -1983,18 +2128,18 @@ function CallFilterPanel() {
   );
 }
 
-function CallsTable({ rows, scopedAccountId = null }) {
+function ActivityTable({ rows, scopedAccountId = null }) {
   const { state, dispatch } = useApp();
   const acctMap = useMemo(() => Object.fromEntries(state.accounts.map(a => [a.id, a])), [state.accounts]);
   const contactMap = useMemo(() => Object.fromEntries(state.allContacts.map(c => [c.id, c])), [state.allContacts]);
   const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
-  const sort = state.callSort;
+  const sort = state.activitySort;
 
   function sortBy(field) {
     const next = sort.field === field
       ? { field, dir: sort.dir === 'asc' ? 'desc' : 'asc' }
       : { field, dir: 'asc' };
-    dispatch({ type: 'SET_CALL_SORT', sort: next });
+    dispatch({ type: 'SET_ACTIVITY_SORT', sort: next });
   }
   function HeaderCell({ k, children, className }) {
     const isSorted = sort.field === k;
@@ -2004,35 +2149,38 @@ function CallsTable({ rows, scopedAccountId = null }) {
       </th>
     );
   }
+  function viewEmailThread(activity) {
+    dispatch({ type: 'OPEN_MODAL', modal: 'email_thread', props: { activity } });
+  }
 
   return (
     <div className="flex-1 overflow-auto scrollbar-thin">
       <table className="min-w-full border-collapse">
         <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
           <tr>
-            <HeaderCell k="started_at">When</HeaderCell>
-            <HeaderCell k="direction">Dir</HeaderCell>
+            <HeaderCell k="occurred_at">When</HeaderCell>
+            <HeaderCell k="type">Type</HeaderCell>
             {!scopedAccountId && <HeaderCell k="account">Account</HeaderCell>}
             <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap">Contact</th>
             <HeaderCell k="user">Rep</HeaderCell>
-            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap">From → To</th>
-            <HeaderCell k="duration">Duration</HeaderCell>
-            <HeaderCell k="status">Status</HeaderCell>
-            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap">Notes</th>
+            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs">Summary</th>
+            <th className="px-3 py-2 text-left font-medium text-gray-600 text-xs whitespace-nowrap"></th>
           </tr>
         </thead>
         <tbody>
-          {rows.map(c => {
-            const acct = c.account_id ? acctMap[c.account_id] : null;
-            const contact = c.contact_id ? contactMap[c.contact_id] : null;
-            const user = c.user_id ? profileMap[c.user_id] : null;
-            const isInbound = c.direction === 'inbound';
+          {rows.map(ev => {
+            const acct = ev.account_id ? acctMap[ev.account_id] : null;
+            const contact = ev.contact_id ? contactMap[ev.contact_id] : null;
+            const user = ev.user_id ? profileMap[ev.user_id] : null;
+            const typeMeta = ACTIVITY_TYPES.find(t => t.value === ev.type);
+            const r = ev.raw;
             return (
-              <tr key={c.id} className="border-b border-gray-100 row-hover">
-                <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap" title={fmtDateTime(c.started_at)}>{relativeTime(c.started_at)}</td>
-                <td className="px-3 py-2 text-sm">
-                  <span className={classNames('inline-flex items-center', isInbound ? 'text-green-700' : 'text-blue-700')} title={isInbound ? 'Inbound' : 'Outbound'}>
-                    {isInbound ? '↓' : '↑'}
+              <tr key={ev.id} className="border-b border-gray-100 row-hover">
+                <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap" title={fmtDateTime(ev.occurred_at)}>{relativeTime(ev.occurred_at)}</td>
+                <td className="px-3 py-2 text-sm whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span>{typeMeta?.icon || '•'}</span>
+                    <span className="text-gray-700">{typeMeta?.label || ev.type}</span>
                   </span>
                 </td>
                 {!scopedAccountId && (
@@ -2045,30 +2193,40 @@ function CallsTable({ rows, scopedAccountId = null }) {
                 <td className="px-3 py-2 text-sm text-gray-800">
                   {contact ? `${contact.first_name} ${contact.last_name || ''}`.trim() : <span className="text-gray-400">—</span>}
                 </td>
-                <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap">{user?.full_name || (isInbound ? <span className="text-gray-400">—</span> : '?')}</td>
-                <td className="px-3 py-2 text-sm text-gray-700 whitespace-nowrap">
-                  <div>{formatPhone(c.from_number)}</div>
-                  <div className="text-xs text-gray-500">→ {formatPhone(c.to_number)}</div>
-                </td>
-                <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap">{fmtCallDuration(c.duration_seconds)}</td>
-                <td className="px-3 py-2 text-sm"><CallStatusPill value={c.status} /></td>
-                <td className="px-3 py-2 text-sm text-gray-700 max-w-xs">
-                  {c.voicemail_url && (
-                    <div className="text-xs mb-0.5">
-                      <a href={c.voicemail_url} target="_blank" rel="noopener" className="text-purple-700 hover:underline">▶ Voicemail{c.voicemail_duration_seconds ? ` (${c.voicemail_duration_seconds}s)` : ''}</a>
+                <td className="px-3 py-2 text-sm text-gray-800 whitespace-nowrap">{user?.full_name || (ev.kind === 'call' && ev.direction === 'inbound' ? <span className="text-gray-400">—</span> : '?')}</td>
+                <td className="px-3 py-2 text-sm text-gray-700 max-w-md">
+                  {ev.kind === 'call' ? (
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <span className={classNames('text-xs', ev.direction === 'inbound' ? 'text-green-700' : 'text-blue-700')}>
+                        {ev.direction === 'inbound' ? '↓ In' : '↑ Out'}
+                      </span>
+                      <span className="text-xs text-gray-500">{formatPhone(r.from_number)} → {formatPhone(r.to_number)}</span>
+                      <CallStatusPill value={r.status} />
+                      {r.duration_seconds != null && <span className="text-xs text-gray-500">· {fmtCallDuration(r.duration_seconds)}</span>}
+                      {r.voicemail_url && <a href={r.voicemail_url} target="_blank" rel="noopener" className="text-xs text-purple-700 hover:underline">▶ Voicemail</a>}
+                      {r.voicemail_transcription && <span className="text-xs italic text-gray-600 truncate-cell w-full" title={r.voicemail_transcription}>"{r.voicemail_transcription}"</span>}
+                      {r.notes && <span className="text-xs text-gray-700 truncate-cell w-full" title={r.notes}>{r.notes}</span>}
+                    </div>
+                  ) : (
+                    <div>
+                      <div className="font-medium text-gray-900 truncate-cell">{r.subject || '(no subject)'}</div>
+                      {r.body && <div className="text-xs text-gray-600 truncate-cell" title={r.body}>{r.body}</div>}
                     </div>
                   )}
-                  {c.voicemail_transcription && <div className="text-xs italic text-gray-600 truncate-cell" title={c.voicemail_transcription}>"{c.voicemail_transcription}"</div>}
-                  {c.notes && <div className="text-xs truncate-cell" title={c.notes}>{c.notes}</div>}
+                </td>
+                <td className="px-3 py-2 text-sm text-right whitespace-nowrap">
+                  {ev.type === 'email' && r.gmail_thread_id && (
+                    <Button size="sm" variant="ghost" onClick={() => viewEmailThread(r)}>View thread</Button>
+                  )}
                 </td>
               </tr>
             );
           })}
           {rows.length === 0 && (
             <tr>
-              <td colSpan={scopedAccountId ? 8 : 9} className="text-center py-12 text-sm text-gray-500">
-                <div className="font-medium text-gray-700 mb-1">No calls yet.</div>
-                <div className="text-xs">Click any phone number to dial.</div>
+              <td colSpan={scopedAccountId ? 6 : 7} className="text-center py-12 text-sm text-gray-500">
+                <div className="font-medium text-gray-700 mb-1">No activity yet.</div>
+                <div className="text-xs">Calls, emails, notes, and meetings will show up here.</div>
               </td>
             </tr>
           )}
@@ -2078,43 +2236,47 @@ function CallsTable({ rows, scopedAccountId = null }) {
   );
 }
 
-function CallListView() {
+function ActivityListView() {
   const { state, dispatch } = useApp();
+  const events = useMemo(
+    () => mergeEvents(state.allCalls, state.allActivities),
+    [state.allCalls, state.allActivities]
+  );
   const filtered = useMemo(
-    () => applyCallFilters(state.allCalls, state.callFilters),
-    [state.allCalls, state.callFilters]
+    () => applyActivityFilters(events, state.activityFilters),
+    [events, state.activityFilters]
   );
   const sorted = useMemo(
-    () => applyCallSort(filtered, state.accounts, state.profiles, state.callSort),
-    [filtered, state.accounts, state.profiles, state.callSort]
+    () => applyActivitySort(filtered, state.accounts, state.profiles, state.activitySort),
+    [filtered, state.accounts, state.profiles, state.activitySort]
   );
 
   return (
     <div className="flex flex-1 overflow-hidden">
-      <CallFilterPanel />
+      <ActivityFilterPanel />
       <div className="flex-1 flex flex-col overflow-hidden">
         <ListTabSwitcher />
         <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
-          <span className="text-sm text-gray-600">{sorted.length} call{sorted.length === 1 ? '' : 's'}</span>
+          <span className="text-sm text-gray-600">{sorted.length} event{sorted.length === 1 ? '' : 's'}</span>
           <div className="ml-auto flex items-center gap-2">
             <div className="w-72">
               <Input
-                placeholder="Search notes, transcription, number…"
-                value={state.callFilters.search}
-                onChange={e => dispatch({ type: 'SET_CALL_FILTERS', filters: { search: e.target.value } })}
+                placeholder="Search notes, subject, number, transcription…"
+                value={state.activityFilters.search}
+                onChange={e => dispatch({ type: 'SET_ACTIVITY_FILTERS', filters: { search: e.target.value } })}
               />
             </div>
           </div>
         </div>
-        {state.allCalls.length === 0 && !state.loading ? (
+        {events.length === 0 && !state.loading ? (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center max-w-sm">
-              <div className="text-base font-medium text-gray-800 mb-1">No calls yet</div>
-              <div className="text-sm text-gray-500 mb-4">Click any phone number on an account or contact to make your first call.</div>
+              <div className="text-base font-medium text-gray-800 mb-1">No activity yet</div>
+              <div className="text-sm text-gray-500 mb-4">Make a call, send an email, or log an activity from any account.</div>
             </div>
           </div>
         ) : (
-          <CallsTable rows={sorted} />
+          <ActivityTable rows={sorted} />
         )}
       </div>
     </div>
@@ -2487,17 +2649,34 @@ function AccountDetailView({ accountId }) {
             {(() => {
               const primary = contacts.find(c => c.is_primary) || contacts[0];
               const dialNumber = primary?.phone || primary?.mobile || account.phone;
-              if (!dialNumber) return null;
+              const emailAddress = primary?.email || account.email;
+              const contactName = primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null;
               return (
-                <Button size="sm"
-                  onClick={() => openDialer(dispatch, {
-                    to: dialNumber, accountId: account.id,
-                    contactId: primary?.id || null,
-                    accountName: account.name,
-                    contactName: primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null,
-                  })}>
-                  📞 Dial
-                </Button>
+                <>
+                  {dialNumber && (
+                    <Button size="sm"
+                      onClick={() => openDialer(dispatch, {
+                        to: dialNumber, accountId: account.id,
+                        contactId: primary?.id || null,
+                        accountName: account.name,
+                        contactName,
+                      })}>
+                      📞 Dial
+                    </Button>
+                  )}
+                  {emailAddress && (
+                    <Button size="sm" variant="secondary"
+                      onClick={() => openEmail(dispatch, {
+                        accountId: account.id,
+                        contactId: primary?.id || null,
+                        accountName: account.name,
+                        contactName,
+                        defaultTo: emailAddress,
+                      })}>
+                      ✉️ Email
+                    </Button>
+                  )}
+                </>
               );
             })()}
             <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_meeting', props: { accountId } })}>📅 Schedule meeting</Button>
@@ -2513,17 +2692,17 @@ function AccountDetailView({ accountId }) {
         </div>
 
         <div className="border-b border-gray-200 flex gap-4 sticky top-0 bg-gray-50 z-10">
-          {['overview','contacts','calls','tasks','activity','notes'].map(t => {
+          {['overview','contacts','tasks','activity','notes'].map(t => {
             const callCount = state.allCalls.filter(x => x.account_id === account.id).length;
+            const activityCount = activities.length + callCount;
             return (
               <button key={t} onClick={() => setTab(t)}
                 className={classNames('px-1 py-2 text-sm font-medium border-b-2',
                   tab === t ? 'border-blue-600 text-blue-700' : 'border-transparent text-gray-600 hover:text-gray-900')}>
                 {t === 'overview' ? 'Overview'
                   : t === 'contacts' ? `Contacts${contacts.length ? ` (${contacts.length})` : ''}`
-                  : t === 'calls' ? `Calls${callCount ? ` (${callCount})` : ''}`
                   : t === 'tasks' ? `Tasks${state.allTasks.filter(x => x.account_id === account.id && !x.completed_at).length ? ` (${state.allTasks.filter(x => x.account_id === account.id && !x.completed_at).length})` : ''}`
-                  : t === 'activity' ? `Activity${activities.length ? ` (${activities.length})` : ''}`
+                  : t === 'activity' ? `Activity${activityCount ? ` (${activityCount})` : ''}`
                   : 'Notes'}
               </button>
             );
@@ -2533,7 +2712,6 @@ function AccountDetailView({ accountId }) {
         <div className="py-4">
           {tab === 'overview' && <OverviewTab account={account} canEdit={canEdit} />}
           {tab === 'contacts' && <ContactsTab account={account} contacts={contacts} canEdit={canEdit} />}
-          {tab === 'calls' && <AccountCallsTab account={account} contacts={contacts} />}
           {tab === 'tasks' && <TasksTab account={account} />}
           {tab === 'activity' && <ActivityTab account={account} activities={activities} contacts={contacts} />}
           {tab === 'notes' && <NotesTab account={account} canEdit={canEdit} />}
@@ -2768,7 +2946,19 @@ function ContactsTab({ account, contacts, canEdit }) {
                 </div>
                 {c.title && <div className="text-xs text-gray-600">{c.title}</div>}
                 <div className="text-xs text-gray-600 mt-1 flex flex-wrap gap-x-4 gap-y-0.5 items-center">
-                  {c.email && <a href={`mailto:${c.email}`} className="text-blue-600 hover:underline">{c.email}</a>}
+                  {c.email && (
+                    <span className="inline-flex items-center gap-1">
+                      <a href={`mailto:${c.email}`} className="text-blue-600 hover:underline">{c.email}</a>
+                      <button
+                        onClick={() => openEmail(dispatch, {
+                          accountId: account.id, contactId: c.id,
+                          accountName: account.name,
+                          contactName: `${c.first_name} ${c.last_name || ''}`.trim(),
+                          defaultTo: c.email,
+                        })}
+                        className="ml-1 text-blue-600 hover:text-blue-800" title="Compose email">✉️</button>
+                    </span>
+                  )}
                   {c.phone && (
                     <span className="inline-flex items-center gap-1">
                       Phone: {formatPhone(c.phone)}
@@ -2818,14 +3008,24 @@ function ActivityTab({ account, activities, contacts }) {
   const { state, dispatch } = useApp();
   const [typeFilter, setTypeFilter] = useState('all');
   const profileMap = useMemo(() => Object.fromEntries(state.profiles.map(p => [p.id, p])), [state.profiles]);
-  const filtered = typeFilter === 'all' ? activities : activities.filter(a => a.type === typeFilter);
   const contactMap = useMemo(() => Object.fromEntries(contacts.map(c => [c.id, c])), [contacts]);
+  const accountCalls = useMemo(() => state.allCalls.filter(c => c.account_id === account.id), [state.allCalls, account.id]);
+  const events = useMemo(() => {
+    const merged = mergeEvents(accountCalls, activities);
+    return merged.sort((a, b) => new Date(b.occurred_at) - new Date(a.occurred_at));
+  }, [accountCalls, activities]);
+  const filtered = typeFilter === 'all' ? events : events.filter(ev => ev.type === typeFilter);
 
   return (
     <div>
       <div className="flex items-center justify-between mb-3">
         <Select value={typeFilter} onChange={e => setTypeFilter(e.target.value)} options={[{value:'all',label:'All types'}, ...ACTIVITY_TYPES.map(t => ({ value: t.value, label: t.label }))]} />
-        <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId: account.id } })}>Log activity</Button>
+        <div className="flex items-center gap-2">
+          {account.caller_id_number && (
+            <span className="text-xs text-gray-500">Caller-ID: <span className="font-medium text-gray-700">{formatPhone(account.caller_id_number)}</span></span>
+          )}
+          <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'log_activity', props: { accountId: account.id } })}>Log activity</Button>
+        </div>
       </div>
       {filtered.length === 0 ? (
         <div className="bg-white border border-gray-200 rounded p-8 text-center">
@@ -2834,22 +3034,58 @@ function ActivityTab({ account, activities, contacts }) {
         </div>
       ) : (
         <div className="space-y-2">
-          {filtered.map(a => {
-            const t = ACTIVITY_TYPES.find(x => x.value === a.type);
-            const contact = a.contact_id ? contactMap[a.contact_id] : null;
-            const user = profileMap[a.user_id];
+          {filtered.map(ev => {
+            const t = ACTIVITY_TYPES.find(x => x.value === ev.type);
+            const contact = ev.contact_id ? contactMap[ev.contact_id] : null;
+            const user = ev.user_id ? profileMap[ev.user_id] : null;
+            const r = ev.raw;
             return (
-              <div key={a.id} className="bg-white border border-gray-200 rounded p-3 flex gap-3">
+              <div key={ev.id} className="bg-white border border-gray-200 rounded p-3 flex gap-3">
                 <div className="w-8 h-8 rounded bg-gray-100 flex items-center justify-center text-base shrink-0">{t?.icon || '•'}</div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-medium text-gray-900 text-sm">{a.subject}</span>
-                    <Pill className="bg-gray-100 text-gray-700">{t?.label}</Pill>
+                    {ev.kind === 'call' ? (
+                      <>
+                        <span className="font-medium text-gray-900 text-sm">{ev.direction === 'inbound' ? 'Inbound call' : 'Outbound call'}</span>
+                        <Pill className="bg-gray-100 text-gray-700">{t?.label}</Pill>
+                        <CallStatusPill value={r.status} />
+                        {r.duration_seconds != null && <span className="text-xs text-gray-500">{fmtCallDuration(r.duration_seconds)}</span>}
+                      </>
+                    ) : (
+                      <>
+                        <span className="font-medium text-gray-900 text-sm">{r.subject || '(no subject)'}</span>
+                        <Pill className="bg-gray-100 text-gray-700">{t?.label}</Pill>
+                      </>
+                    )}
                     {contact && <span className="text-xs text-gray-600">with {contact.first_name} {contact.last_name || ''}</span>}
                   </div>
-                  {a.body && <div className="text-sm text-gray-700 mt-1 whitespace-pre-wrap">{a.body}</div>}
-                  <div className="text-xs text-gray-500 mt-1">
-                    {user?.full_name || 'Unknown'} · <span title={fmtDateTime(a.occurred_at)}>{relativeTime(a.occurred_at)}</span>
+                  {ev.kind === 'call' ? (
+                    <>
+                      <div className="text-xs text-gray-500 mt-1">
+                        {formatPhone(r.from_number)} → {formatPhone(r.to_number)}
+                      </div>
+                      {r.voicemail_url && (
+                        <div className="text-xs mt-1">
+                          <a href={r.voicemail_url} target="_blank" rel="noopener" className="text-purple-700 hover:underline">▶ Voicemail{r.voicemail_duration_seconds ? ` (${r.voicemail_duration_seconds}s)` : ''}</a>
+                        </div>
+                      )}
+                      {r.voicemail_transcription && <div className="text-sm italic text-gray-700 mt-1">"{r.voicemail_transcription}"</div>}
+                      {r.notes && <div className="text-sm text-gray-700 mt-1 whitespace-pre-wrap">{r.notes}</div>}
+                    </>
+                  ) : (
+                    <>
+                      {r.email_to && <div className="text-xs text-gray-500 mt-1">To: {r.email_to}</div>}
+                      {r.body && <div className="text-sm text-gray-700 mt-1 whitespace-pre-wrap">{r.body}</div>}
+                    </>
+                  )}
+                  <div className="text-xs text-gray-500 mt-1 flex items-center gap-2">
+                    <span>{user?.full_name || 'Unknown'}</span>
+                    <span>·</span>
+                    <span title={fmtDateTime(ev.occurred_at)}>{relativeTime(ev.occurred_at)}</span>
+                    {ev.type === 'email' && r.gmail_thread_id && (
+                      <button onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'email_thread', props: { activity: r } })}
+                        className="ml-auto text-blue-600 hover:underline">View thread</button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -2922,49 +3158,6 @@ function TasksTab({ account }) {
           })}
         </div>
       )}
-    </div>
-  );
-}
-
-/* =====================================================================
-   CALLS TAB — per-account sub-view of the calls log
-   ===================================================================== */
-function AccountCallsTab({ account, contacts }) {
-  const { state, dispatch } = useApp();
-  const rows = useMemo(() => {
-    const accountCalls = state.allCalls.filter(c => c.account_id === account.id);
-    return applyCallSort(accountCalls, state.accounts, state.profiles, state.callSort);
-  }, [state.allCalls, state.callSort, account.id]);
-
-  const primary = contacts.find(c => c.is_primary) || contacts[0];
-  const fallbackPhone = primary?.phone || primary?.mobile || account.phone;
-
-  return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div className="text-sm text-gray-600">
-          {rows.length} call{rows.length === 1 ? '' : 's'}
-          {account.caller_id_number && (
-            <span className="ml-3 text-xs text-gray-500">
-              This account's caller-ID: <span className="font-medium text-gray-700">{formatPhone(account.caller_id_number)}</span>
-            </span>
-          )}
-        </div>
-        {fallbackPhone && (
-          <Button size="sm"
-            onClick={() => openDialer(dispatch, {
-              to: fallbackPhone, accountId: account.id,
-              contactId: primary?.id || null,
-              accountName: account.name,
-              contactName: primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null,
-            })}>
-            📞 Dial {primary ? `${primary.first_name}` : 'main line'}
-          </Button>
-        )}
-      </div>
-      <div className="bg-white border border-gray-200 rounded overflow-hidden">
-        <CallsTable rows={rows} scopedAccountId={account.id} />
-      </div>
     </div>
   );
 }
@@ -3702,6 +3895,170 @@ function openDialer(dispatch, { to, accountId, contactId, accountName, contactNa
   dispatch({ type: 'OPEN_MODAL', modal: 'dialer', props: { to: e164, accountId, contactId, accountName, contactName } });
 }
 
+/* =====================================================================
+   EMAIL COMPOSER MODAL — send via the rep's Gmail
+   ===================================================================== */
+function EmailModal() {
+  const { state, dispatch } = useApp();
+  const { accountId, contactId, accountName, contactName, defaultTo, replyToActivity } = state.modalProps || {};
+
+  const isReply = !!replyToActivity;
+  const [to, setTo] = useState(defaultTo || '');
+  const [subject, setSubject] = useState(isReply
+    ? (replyToActivity.email_subject?.startsWith('Re: ')
+        ? replyToActivity.email_subject
+        : `Re: ${replyToActivity.email_subject || ''}`)
+    : '');
+  const [body, setBody] = useState('');
+  const [status, setStatus] = useState('idle'); // idle | sending | sent | error
+  const [errorMsg, setErrorMsg] = useState('');
+
+  async function send() {
+    if (!to.trim()) { setStatus('error'); setErrorMsg('Recipient required.'); return; }
+    if (!state.googleConnected) {
+      setStatus('error');
+      setErrorMsg('Google not connected. Open the user menu (top-right) and click Reconnect Google.');
+      return;
+    }
+    setStatus('sending'); setErrorMsg('');
+    try {
+      const sent = await gmail.send({
+        to: to.trim(),
+        subject: subject.trim(),
+        body,
+        threadId: replyToActivity?.gmail_thread_id || null,
+        replyToMessageId: replyToActivity?.gmail_message_id || null,
+      });
+
+      const { data: activity, error } = await supabase.from('activities').insert({
+        account_id: accountId,
+        contact_id: contactId || null,
+        user_id: state.profile.id,
+        type: 'email',
+        subject: subject.trim() || '(no subject)',
+        body,
+        occurred_at: new Date().toISOString(),
+        gmail_thread_id: sent.threadId || null,
+        gmail_message_id: sent.id || null,
+        email_to: to.trim(),
+        email_from: state.user.email || null,
+        email_subject: subject.trim() || null,
+      }).select().single();
+      if (error) throw new Error(error.message);
+      if (activity) dispatch({ type: 'ADD_ACTIVITY', activity });
+
+      setStatus('sent');
+      notify(dispatch, 'Email sent.');
+      setTimeout(() => dispatch({ type: 'CLOSE_MODAL' }), 600);
+    } catch (e) {
+      setStatus('error');
+      setErrorMsg(e?.message || 'Failed to send.');
+    }
+  }
+
+  return (
+    <Modal open={true} onClose={() => dispatch({ type: 'CLOSE_MODAL' })} title={isReply ? 'Reply' : 'New email'} width="max-w-2xl">
+      <div className="space-y-3">
+        {accountName && (
+          <div className="text-xs text-gray-500">
+            {contactName ? <>To <span className="font-medium text-gray-700">{contactName}</span> at <span className="font-medium text-gray-700">{accountName}</span></> : <>At <span className="font-medium text-gray-700">{accountName}</span></>}
+          </div>
+        )}
+        <Input label="To" value={to} onChange={e => setTo(e.target.value)} placeholder="prospect@example.com" />
+        <Input label="Subject" value={subject} onChange={e => setSubject(e.target.value)} />
+        <Textarea label="Body" rows={10} value={body} onChange={e => setBody(e.target.value)} placeholder="Type your message…" />
+        {!state.googleConnected && (
+          <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+            Google isn't connected for this user yet. Click Connect Google in the user menu (top-right), then reopen this dialog.
+          </div>
+        )}
+        {status === 'error' && <div className="text-xs text-red-600">{errorMsg}</div>}
+        {status === 'sent'  && <div className="text-xs text-green-700">Sent.</div>}
+        <div className="flex justify-end gap-2 pt-2 border-t border-gray-200">
+          <Button variant="secondary" onClick={() => dispatch({ type: 'CLOSE_MODAL' })}>Cancel</Button>
+          <Button onClick={send} disabled={status === 'sending' || status === 'sent'}>
+            {status === 'sending' ? 'Sending…' : status === 'sent' ? 'Sent' : 'Send'}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function openEmail(dispatch, { accountId, contactId, accountName, contactName, defaultTo, replyToActivity }) {
+  dispatch({
+    type: 'OPEN_MODAL',
+    modal: 'email',
+    props: { accountId, contactId, accountName, contactName, defaultTo: defaultTo || '', replyToActivity: replyToActivity || null },
+  });
+}
+
+/* =====================================================================
+   EMAIL THREAD VIEWER — fetches the live thread from Gmail
+   ===================================================================== */
+function EmailThreadModal() {
+  const { state, dispatch } = useApp();
+  const { activity } = state.modalProps || {};
+  const [thread, setThread] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    if (!activity?.gmail_thread_id) { setLoading(false); setErr('No thread ID on this email.'); return; }
+    (async () => {
+      try {
+        const t = await gmail.getThread(activity.gmail_thread_id);
+        setThread(t);
+      } catch (e) {
+        setErr(e?.message || 'Failed to load thread.');
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [activity?.id]);
+
+  function replyAll() {
+    if (!thread?.messages?.length) return;
+    const last = thread.messages[thread.messages.length - 1];
+    const myEmail = (state.user?.email || '').toLowerCase();
+    // Reply target: whoever isn't us in the From line
+    const target = last.from && !last.from.toLowerCase().includes(myEmail)
+      ? last.from
+      : last.to;
+    dispatch({ type: 'CLOSE_MODAL' });
+    setTimeout(() => openEmail(dispatch, {
+      accountId: activity.account_id, contactId: activity.contact_id,
+      accountName: null, contactName: null,
+      defaultTo: target,
+      replyToActivity: { ...activity, gmail_message_id: last.id, gmail_thread_id: thread.id },
+    }), 50);
+  }
+
+  return (
+    <Modal open={true} onClose={() => dispatch({ type: 'CLOSE_MODAL' })} title={activity?.email_subject || activity?.subject || 'Email thread'} width="max-w-3xl">
+      <div className="space-y-3 max-h-[70vh] overflow-y-auto scrollbar-thin">
+        {loading && <div className="text-sm text-gray-500">Loading thread…</div>}
+        {err && <div className="text-sm text-red-600">{err}</div>}
+        {thread?.messages?.map((m, i) => (
+          <div key={m.id} className={classNames('border rounded p-3', i === thread.messages.length - 1 ? 'border-blue-200 bg-blue-50/40' : 'border-gray-200 bg-white')}>
+            <div className="text-xs text-gray-600 flex flex-wrap gap-x-3">
+              <span><b>From:</b> {m.from}</span>
+              <span><b>To:</b> {m.to}</span>
+              {m.internalDate && <span>{m.internalDate.toLocaleString()}</span>}
+            </div>
+            <div className="text-sm text-gray-800 mt-2 whitespace-pre-wrap">{m.body || m.snippet}</div>
+          </div>
+        ))}
+        {thread && thread.messages?.length === 0 && <div className="text-sm text-gray-500">Thread is empty.</div>}
+      </div>
+      <div className="flex justify-end gap-2 pt-3 border-t border-gray-200 mt-3">
+        <Button variant="secondary" onClick={() => dispatch({ type: 'CLOSE_MODAL' })}>Close</Button>
+        {thread?.messages?.length > 0 && <Button onClick={replyAll}>Reply</Button>}
+      </div>
+    </Modal>
+  );
+}
+
 function ImportModal() {
   const { state, dispatch } = useApp();
   const [step, setStep] = useState(1);
@@ -4026,18 +4383,20 @@ function App() {
     if (!state.user) return;
     (async () => {
       dispatch({ type: 'SET_LOADING', loading: true });
-      const [{ data: profs }, { data: accs }, { data: ctcs }, { data: tsks }, { data: cls }] = await Promise.all([
+      const [{ data: profs }, { data: accs }, { data: ctcs }, { data: tsks }, { data: cls }, { data: acts }] = await Promise.all([
         supabase.from('profiles').select('*').order('full_name', { ascending: true }),
         supabase.from('accounts').select('*').neq('status', 'deleted').order('updated_at', { ascending: false }),
         supabase.from('contacts').select('*').order('created_at', { ascending: false }),
         supabase.from('tasks').select('*').order('due_at', { ascending: true, nullsFirst: false }),
         supabase.from('calls').select('*').order('started_at', { ascending: false }).limit(1000),
+        supabase.from('activities').select('*').order('occurred_at', { ascending: false }).limit(1000),
       ]);
       if (profs) dispatch({ type: 'SET_PROFILES', profiles: profs });
       if (accs) dispatch({ type: 'LOAD_ACCOUNTS', accounts: accs });
       if (ctcs) dispatch({ type: 'SET_ALL_CONTACTS', contacts: ctcs });
       if (tsks) dispatch({ type: 'SET_ALL_TASKS', tasks: tsks });
       if (cls) dispatch({ type: 'SET_ALL_CALLS', calls: cls });
+      if (acts) dispatch({ type: 'SET_ALL_ACTIVITIES', activities: acts });
       dispatch({ type: 'SET_LOADING', loading: false });
     })();
   }, [state.user?.id]);
@@ -4147,8 +4506,8 @@ function App() {
               ? <ContactListView />
               : state.route.tab === 'tasks'
                 ? <TaskListView />
-                : state.route.tab === 'calls'
-                  ? <CallListView />
+                : state.route.tab === 'activity'
+                  ? <ActivityListView />
                   : <AccountListView />}
       </div>
       {state.modal === 'add_account' && <AddAccountModal />}
@@ -4159,6 +4518,8 @@ function App() {
       {state.modal === 'create_task' && <TaskModal />}
       {state.modal === 'edit_task' && <TaskModal />}
       {state.modal === 'dialer' && <DialerModal />}
+      {state.modal === 'email' && <EmailModal />}
+      {state.modal === 'email_thread' && <EmailThreadModal />}
       <Toast />
     </AppCtx.Provider>
   );
