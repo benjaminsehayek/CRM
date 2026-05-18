@@ -421,6 +421,63 @@ const crocsReport = {
       .replace(/\s+/g, ' ').trim();
   },
 
+  // ─── Validators (ported from the standalone tool) ──────────────────────
+  validCoords(lat, lng) {
+    const a = parseFloat(lat), b = parseFloat(lng);
+    if (!a || !b) return false;
+    // US + Canada bounding box
+    if (a < 24 || a > 72) return false;
+    if (b < -170 || b > -50) return false;
+    return true;
+  },
+  validDomain(domain) {
+    if (!domain) return false;
+    if (/[\/\&#?=%@]/.test(domain)) return false;
+    return /^[a-zA-Z0-9][a-zA-Z0-9\-.]*\.[a-zA-Z]{2,}$/.test(domain);
+  },
+  NEIGHBOR_STATES: {
+    WA: ['WA','OR','ID'],
+    OR: ['OR','WA','ID','CA','NV'],
+    ID: ['ID','WA','OR','MT','WY','UT','NV'],
+    CA: ['CA','OR','NV','AZ'],
+    MT: ['MT','ID','WY','ND','SD'],
+    NV: ['NV','OR','ID','UT','AZ','CA'],
+    AZ: ['AZ','CA','NV','UT','NM'],
+  },
+  locationPlausible(candidate, expectedState) {
+    if (!expectedState) return true;
+    if (!candidate.state) return true; // unknown state — accept with caveat
+    const cs = candidate.state.trim().toUpperCase();
+    const accepted = this.NEIGHBOR_STATES[expectedState.toUpperCase()] || [expectedState.toUpperCase()];
+    return accepted.includes(cs);
+  },
+  namePlausible(foundName, hint) {
+    if (!foundName || !hint) return false;
+    const foundClean = foundName.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const hintClean  = hint.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (foundClean.includes(hintClean) || hintClean.includes(foundClean)) return true;
+    const foundWords = foundName.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 4);
+    const hintWords  = hint.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 4);
+    return foundWords.some(w => hintClean.includes(w)) || hintWords.some(w => foundClean.includes(w));
+  },
+
+  // ─── parseMapsUrl: extract lat/lng/cid/placeId/name from a Maps URL ────
+  parseMapsUrl(url) {
+    const out = {};
+    if (!url) return out;
+    let m = url.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*)/);
+    if (m) { out.lat = parseFloat(m[1]); out.lng = parseFloat(m[2]); }
+    m = url.match(/!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)/);
+    if (m) { out.lat = parseFloat(m[1]); out.lng = parseFloat(m[2]); }
+    m = url.match(/[?&]cid=(\d+)/) || url.match(/\/maps\?.*?cid=(\d+)/);
+    if (m) out.cid = m[1];
+    m = url.match(/place_id=([A-Za-z0-9_\-]+)/);
+    if (m) out.placeId = m[1];
+    m = url.match(/\/place\/([^/@?]+)/);
+    if (m) out.name = decodeURIComponent(m[1].replace(/\+/g, ' '));
+    return out;
+  },
+
   // ─── Derive keywords from an account ──────────────────────────────────
   deriveKeywords(account) {
     if (account.report_keywords && account.report_keywords.trim()) {
@@ -452,13 +509,65 @@ const crocsReport = {
     if (!items.length) return [];
     return items.slice(0, 5).map(i => this.mapItemToResult(i));
   },
-  async lookupByDomain(input) {
+  async lookupByDomain(input, opts = {}) {
     const domain = input.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+    if (!this.validDomain(domain)) return [];
     const d = await this.workerPost('/v3/business_data/business_listings/search/live', [{
       categories: [], filters: [['domain', '=', domain]], language_code: 'en', limit: 5,
     }]);
     const items = d.tasks?.[0]?.result?.[0]?.items || [];
+    if (!items.length) {
+      // Name fallback: derive a seed from the domain (or opts.hint) and search by name.
+      // Tag the result with plausibility so the caller can reject obviously wrong matches.
+      const seedName = (opts.hint || domain.replace(/\.[a-z]{2,}$/, '').replace(/[.-]/g, ' ')).trim();
+      const nameResults = await this.lookupByName(seedName);
+      if (nameResults.length) {
+        nameResults[0]._nameSearchFallback = true;
+        nameResults[0]._fallbackPlausible  = this.namePlausible(nameResults[0].name, domain) || this.namePlausible(nameResults[0].name, seedName);
+      }
+      return nameResults;
+    }
     return items.map(i => this.listingToResult(i));
+  },
+  async lookupByPhone(input) {
+    const digits = (input || '').replace(/\D/g, '');
+    const last10 = digits.slice(-10);
+    if (last10.length < 10) return [];
+    const d = await this.workerPost('/v3/business_data/business_listings/search/live', [{
+      categories: [], filters: [['phone', 'like', `%${last10}%`]], language_code: 'en', limit: 5,
+    }]);
+    const items = d.tasks?.[0]?.result?.[0]?.items || [];
+    return items.map(i => this.listingToResult(i));
+  },
+  async lookupFromMapsUrl(url) {
+    const parsed = this.parseMapsUrl(url);
+    // If the URL embeds a name, prefer a SERP search anchored to the parsed
+    // coordinates so the cid/placeId can be resolved by Google.
+    if (parsed.name) {
+      const locParam = parsed.lat && parsed.lng ? `${parsed.lat.toFixed(7)},${parsed.lng.toFixed(7)},14z` : undefined;
+      const body = [{ keyword: parsed.name, language_code: 'en', depth: 5, ...(locParam ? { location_coordinate: locParam } : { location_name: 'United States' }) }];
+      const d = await this.workerPost('/v3/serp/google/maps/live/advanced', body);
+      const items = (d.tasks?.[0]?.result?.[0]?.items || []).filter(i => i.type === 'maps_search');
+      if (items.length) {
+        const results = items.slice(0, 5).map(i => this.mapItemToResult(i));
+        if (parsed.cid || parsed.placeId) {
+          const match = results.find(r => (parsed.cid && r.cid === parsed.cid) || (parsed.placeId && r.placeId === parsed.placeId));
+          if (match) return [match];
+        }
+        return results;
+      }
+    }
+    // Bare coords with no name match — return a stub.
+    if (parsed.lat && parsed.lng) {
+      return [{
+        name: parsed.name || 'Business from Maps URL',
+        address: '', city: '', state: '',
+        latitude: parsed.lat, longitude: parsed.lng,
+        placeId: parsed.placeId, cid: parsed.cid,
+        _fromMapsUrl: true,
+      }];
+    }
+    return [];
   },
   mapItemToResult(item) {
     const ap = (item.address || '').split(',').map(s => s.trim());
@@ -493,7 +602,40 @@ const crocsReport = {
   },
 
   // ─── Resolve a business location for an account (cache on the row) ────
+  // Full strategy ladder, mirroring the standalone tool's batch-mode resolver:
+  //   0. Cached gbp_lat/lng on the account
+  //   1. account.website if it's a Maps URL → lookupFromMapsUrl
+  //   2. Domain lookup (with name-fallback plausibility check)
+  //   3. Phone lookup
+  //   4. Name search with city + state context
+  //   5. Name search broad (US-wide)
+  // Each candidate is validated for coord bounds, location plausibility
+  // (must be in the expected state or a neighbor), and name plausibility
+  // (when the result came via the domain → name fallback path).
+  async _cacheCandidate(account, candidate, dispatch) {
+    const patch = {
+      gbp_lat: candidate.latitude,
+      gbp_lng: candidate.longitude,
+      gbp_cid: candidate.cid,
+      gbp_place_id: candidate.placeId,
+    };
+    const { data } = await supabase.from('accounts').update(patch).eq('id', account.id).select().single();
+    if (data && dispatch) dispatch({ type: 'UPSERT_ACCOUNT', account: data });
+    return {
+      name: candidate.name || account.name,
+      latitude: candidate.latitude,
+      longitude: candidate.longitude,
+      cid: candidate.cid || null,
+      placeId: candidate.placeId || null,
+      website: account.website || candidate.website || null,
+      city:    candidate.city  || account.city  || '',
+      state:   candidate.state || account.state || '',
+      address: candidate.address || account.street || '',
+    };
+  },
+
   async resolveBusinessLocation(account, dispatch) {
+    // 0. Cached coords on the account
     if (account.gbp_lat && account.gbp_lng) {
       return {
         name: account.name,
@@ -506,39 +648,49 @@ const crocsReport = {
         address: account.street || '',
       };
     }
-    // First-time lookup: try domain → name+located → name
-    let candidate = null;
-    if (account.website) {
+
+    const expectedState = (account.state || '').toUpperCase();
+    const city = account.city || '';
+
+    // 1. If account.website is a Maps URL, parse it.
+    if (account.website && /maps\.app\.goo\.gl|google\.com\/maps|maps\.google\.com/i.test(account.website)) {
       try {
-        const r = await this.lookupByDomain(account.website);
-        if (r.length) candidate = r[0];
+        const r = await this.lookupFromMapsUrl(account.website);
+        const c = r[0];
+        if (c && this.validCoords(c.latitude, c.longitude) && this.locationPlausible(c, expectedState)) {
+          return await this._cacheCandidate(account, c, dispatch);
+        }
       } catch {}
     }
-    if (!candidate) {
-      try {
-        const r = await this.lookupByNameLocated(account.name, account.city, account.state);
-        if (r.length) candidate = r[0];
-      } catch {}
+
+    // 2-5. Lookup ladder with validation
+    let domain = '';
+    if (account.website && !/maps\.app\.goo\.gl|google\.com\/maps/i.test(account.website)) {
+      const cleaned = account.website.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+      if (this.validDomain(cleaned)) domain = cleaned;
     }
-    if (!candidate) {
-      try {
-        const r = await this.lookupByName(account.name);
-        if (r.length) candidate = r[0];
-      } catch {}
+
+    const strategies = [];
+    if (domain)         strategies.push(() => this.lookupByDomain(domain, { hint: account.name }));
+    if (account.phone)  strategies.push(() => this.lookupByPhone(account.phone));
+    strategies.push(() => this.lookupByNameLocated(account.name, city, expectedState));
+    strategies.push(() => this.lookupByName(account.name));
+
+    for (const run of strategies) {
+      let results = [];
+      try { results = await run() || []; } catch { continue; }
+      for (const c of results.slice(0, 3)) {
+        if (!this.validCoords(c.latitude, c.longitude)) continue;
+        // Name fallback (from lookupByDomain) requires plausibility
+        if (c._nameSearchFallback && !c._fallbackPlausible) continue;
+        // For name-based strategies, also require name plausibility against account.name
+        // (avoids picking a different business with a vaguely similar name in the wrong state)
+        if (!this.locationPlausible(c, expectedState)) continue;
+        return await this._cacheCandidate(account, c, dispatch);
+      }
     }
-    if (!candidate || !candidate.latitude || !candidate.longitude) {
-      throw new Error('Could not locate business on Google Maps');
-    }
-    // Persist to the account
-    const patch = {
-      gbp_lat: candidate.latitude,
-      gbp_lng: candidate.longitude,
-      gbp_cid: candidate.cid,
-      gbp_place_id: candidate.placeId,
-    };
-    const { data } = await supabase.from('accounts').update(patch).eq('id', account.id).select().single();
-    if (data && dispatch) dispatch({ type: 'UPSERT_ACCOUNT', account: data });
-    return candidate;
+
+    throw new Error('Could not locate business on Google Maps');
   },
 
   // ─── Reverse geocode → neighborhood label (Nominatim, free) ───────────
