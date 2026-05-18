@@ -521,6 +521,10 @@ const initialState = {
   // Dashboard — pipeline stage transition audit log
   stageChanges: [],
 
+  // Power dialer — queue-driven sequential calling
+  dialerQueue: null, // null | { items, position, status, source, outcomeCounts }
+  dialerPanelOpen: false,
+
   // Twilio Voice — Device status (Device instance itself lives in a ref).
   twilio: { status: 'idle', error: null },  // idle | registering | ready | error
 };
@@ -643,6 +647,49 @@ function appReducer(state, action) {
     case 'REMOVE_CALL': return { ...state, allCalls: state.allCalls.filter(c => c.id !== action.id) };
 
     case 'SET_STAGE_CHANGES': return { ...state, stageChanges: action.changes };
+
+    case 'START_DIAL_QUEUE': {
+      return {
+        ...state,
+        dialerQueue: {
+          items: action.items,
+          position: 0,
+          status: 'starting',
+          source: action.source || 'accounts',
+          outcomeCounts: { no_answer: 0, voicemail: 0, interested: 0, not_interested: 0, bad_number: 0, callback: 0 },
+        },
+        dialerPanelOpen: true,
+      };
+    }
+    case 'ADVANCE_DIAL_QUEUE': {
+      if (!state.dialerQueue) return state;
+      const nextPos = state.dialerQueue.position + 1;
+      const atEnd = nextPos >= state.dialerQueue.items.length;
+      return {
+        ...state,
+        dialerQueue: {
+          ...state.dialerQueue,
+          position: atEnd ? state.dialerQueue.position : nextPos,
+          status: atEnd ? 'done' : 'starting',
+        },
+      };
+    }
+    case 'PAUSE_DIAL_QUEUE':
+      return state.dialerQueue ? { ...state, dialerQueue: { ...state.dialerQueue, status: 'paused' } } : state;
+    case 'RESUME_DIAL_QUEUE':
+      return state.dialerQueue ? { ...state, dialerQueue: { ...state.dialerQueue, status: 'starting' } } : state;
+    case 'STOP_DIAL_QUEUE':
+      return { ...state, dialerQueue: null };
+    case 'LOG_DIAL_OUTCOME': {
+      if (!state.dialerQueue) return state;
+      const counts = { ...state.dialerQueue.outcomeCounts };
+      counts[action.outcome] = (counts[action.outcome] || 0) + 1;
+      return { ...state, dialerQueue: { ...state.dialerQueue, outcomeCounts: counts } };
+    }
+    case 'TOGGLE_DIALER_PANEL':
+      return { ...state, dialerPanelOpen: !state.dialerPanelOpen };
+    case 'SET_DIALER_PANEL_OPEN':
+      return { ...state, dialerPanelOpen: !!action.open };
     case 'SET_ALL_ACTIVITIES': return { ...state, allActivities: action.activities };
     case 'UPSERT_ALL_ACTIVITY': {
       const i = state.allActivities.findIndex(a => a.id === action.activity.id);
@@ -1363,6 +1410,7 @@ function AccountListView() {
         <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
           <span className="text-sm text-gray-600">{sorted.length} account{sorted.length === 1 ? '' : 's'}</span>
           <div className="ml-auto flex items-center gap-2">
+            <Button size="sm" onClick={() => startDialerQueue(dispatch, sorted, 'accounts', { state })}>📞 Start dialing</Button>
             <ColumnsMenu />
           </div>
         </div>
@@ -1660,12 +1708,15 @@ function ContactListView() {
         <SavedViewsBar kind="contacts" />
         <div className="px-4 py-2 flex items-center gap-3 bg-white border-b border-gray-200">
           <span className="text-sm text-gray-600">{sorted.length} contact{sorted.length === 1 ? '' : 's'}</span>
-          <div className="ml-auto w-72">
-            <Input
-              placeholder="Search name, email, phone, account…"
-              value={state.contactFilters.search}
-              onChange={e => dispatch({ type: 'SET_CONTACT_FILTERS', filters: { search: e.target.value } })}
-            />
+          <div className="ml-auto flex items-center gap-2">
+            <Button size="sm" onClick={() => startDialerQueue(dispatch, sorted, 'contacts', { state })}>📞 Start dialing</Button>
+            <div className="w-72">
+              <Input
+                placeholder="Search name, email, phone, account…"
+                value={state.contactFilters.search}
+                onChange={e => dispatch({ type: 'SET_CONTACT_FILTERS', filters: { search: e.target.value } })}
+              />
+            </div>
           </div>
         </div>
         <ContactBulkActionBar rows={sorted} />
@@ -1979,6 +2030,7 @@ function TaskListView() {
                 onChange={e => dispatch({ type: 'SET_TASK_FILTERS', filters: { search: e.target.value } })}
               />
             </div>
+            <Button size="sm" variant="secondary" onClick={() => startDialerQueue(dispatch, sorted, 'tasks', { state })}>📞 Start dialing</Button>
             <Button size="sm" onClick={() => dispatch({ type: 'OPEN_MODAL', modal: 'create_task' })}>+ New task</Button>
           </div>
         </div>
@@ -4067,6 +4119,433 @@ function DialerModal() {
   );
 }
 
+/* =====================================================================
+   POWER DIALER SIDEBAR — persistent right-side queue dialer
+   ===================================================================== */
+const DIALER_OUTCOMES = [
+  { value: 'no_answer',      label: '📵 No answer',      nextBumpDays: 3 },
+  { value: 'voicemail',      label: '📨 Voicemail',      nextBumpDays: 5 },
+  { value: 'interested',     label: '💬 Interested',     nextBumpDays: null },
+  { value: 'not_interested', label: '❌ Not interested', nextBumpDays: null, stage: 'opportunity_lost' },
+  { value: 'bad_number',     label: '🚫 Bad number',     nextBumpDays: null },
+  { value: 'callback',       label: '📅 Callback',       nextBumpDays: null, openTask: true },
+];
+
+const DIALER_AUTO_ADVANCE_KEY = 'crm.dialer.autoAdvanceSeconds';
+function loadAutoAdvance() {
+  const raw = parseInt(localStorage.getItem(DIALER_AUTO_ADVANCE_KEY) || '5', 10);
+  return isNaN(raw) ? 5 : Math.max(0, Math.min(60, raw));
+}
+function saveAutoAdvance(n) {
+  try { localStorage.setItem(DIALER_AUTO_ADVANCE_KEY, String(n)); } catch {}
+}
+
+// Convert a list of accounts/contacts/tasks into queue items with phone numbers.
+function buildDialerQueue(rows, { source, state }) {
+  const acctMap = Object.fromEntries(state.accounts.map(a => [a.id, a]));
+  const contactsByAccount = state.allContacts.reduce((m, c) => {
+    (m[c.account_id] = m[c.account_id] || []).push(c); return m;
+  }, {});
+
+  const items = [];
+  for (const r of rows) {
+    if (source === 'accounts') {
+      const acct = r;
+      const primary = (contactsByAccount[acct.id] || []).find(c => c.is_primary) || (contactsByAccount[acct.id] || [])[0];
+      const phone = primary?.phone || primary?.mobile || acct.phone;
+      if (!phone) continue;
+      items.push({
+        accountId: acct.id,
+        contactId: primary?.id || null,
+        phone,
+        accountName: acct.name,
+        contactName: primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null,
+      });
+    } else if (source === 'contacts') {
+      const c = r;
+      const phone = c.phone || c.mobile;
+      if (!phone) continue;
+      const acct = acctMap[c.account_id];
+      items.push({
+        accountId: c.account_id,
+        contactId: c.id,
+        phone,
+        accountName: acct?.name || null,
+        contactName: `${c.first_name} ${c.last_name || ''}`.trim(),
+      });
+    } else if (source === 'tasks') {
+      const t = r;
+      const acct = acctMap[t.account_id];
+      if (!acct) continue;
+      const primary = (contactsByAccount[acct.id] || []).find(c => c.is_primary) || (contactsByAccount[acct.id] || [])[0];
+      const phone = primary?.phone || primary?.mobile || acct.phone;
+      if (!phone) continue;
+      items.push({
+        accountId: acct.id,
+        contactId: primary?.id || null,
+        phone,
+        accountName: acct.name,
+        contactName: primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null,
+      });
+    }
+  }
+  return items;
+}
+
+function startDialerQueue(dispatch, rows, source, ctx) {
+  const items = buildDialerQueue(rows, { source, state: ctx.state });
+  if (!items.length) {
+    notify(dispatch, 'Nothing to dial — none of those rows have a phone number.', 'warn');
+    return;
+  }
+  dispatch({ type: 'START_DIAL_QUEUE', items, source });
+}
+
+function DialerSidebar() {
+  const { state, dispatch } = useApp();
+  const q = state.dialerQueue;
+  const open = state.dialerPanelOpen;
+
+  const [callStatus, setCallStatus] = useState('idle'); // idle | connecting | on_call | ended | awaiting_outcome | error
+  const [errorMsg, setErrorMsg] = useState('');
+  const [duration, setDuration] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+  const [notes, setNotes] = useState('');
+  const [autoAdvance, setAutoAdvance] = useState(loadAutoAdvance());
+  const [countdown, setCountdown] = useState(null);
+
+  const callRef = useRef(null);
+  const sidRef = useRef(null);
+  const timerRef = useRef(null);
+  const countdownRef = useRef(null);
+
+  const current = q ? q.items[q.position] : null;
+  const upcoming = q ? q.items.slice(q.position + 1, q.position + 4) : [];
+
+  function fmtDur(s) { return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; }
+
+  function teardownCall() {
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    if (callRef.current) { try { callRef.current.disconnect(); } catch {} callRef.current = null; }
+  }
+  function teardownCountdown() {
+    if (countdownRef.current) { clearInterval(countdownRef.current); countdownRef.current = null; }
+    setCountdown(null);
+  }
+
+  // Auto-dial when queue advances and status is 'starting'
+  useEffect(() => {
+    if (!current || !q || q.status !== 'starting') return;
+    if (state.twilio.status !== 'ready') return;
+    // Reset state for new call
+    setCallStatus('idle');
+    setNotes('');
+    setDuration(0);
+    setIsMuted(false);
+    sidRef.current = null;
+    teardownCountdown();
+    // small delay so React renders the new prospect before dialing
+    const t = setTimeout(() => dial(), 200);
+    return () => clearTimeout(t);
+  }, [q?.position, q?.status, state.twilio.status]);
+
+  // Cleanup on unmount
+  useEffect(() => () => { teardownCall(); teardownCountdown(); }, []);
+
+  async function dial() {
+    const device = window.__twilioDevice;
+    if (!device || state.twilio.status !== 'ready') {
+      setCallStatus('error');
+      setErrorMsg(state.twilio.error || 'Phone not ready');
+      return;
+    }
+    if (!current) return;
+    setCallStatus('connecting');
+    setErrorMsg('');
+    try {
+      const e164 = (() => {
+        const d = digitsOnly(current.phone);
+        if (!d) return null;
+        if (d.length === 11 && d.startsWith('1')) return '+' + d;
+        if (d.length === 10) return '+1' + d;
+        return null;
+      })();
+      if (!e164) { setCallStatus('error'); setErrorMsg('Invalid phone'); return; }
+
+      const call = await device.connect({
+        params: {
+          To: e164,
+          accountId: current.accountId || '',
+          contactId: current.contactId || '',
+          userId: state.profile.id,
+        },
+      });
+      callRef.current = call;
+      sidRef.current = call.parameters?.CallSid || null;
+      call.on('accept', () => {
+        sidRef.current = call.parameters?.CallSid || sidRef.current;
+        setCallStatus('on_call');
+        const start = Date.now();
+        timerRef.current = setInterval(() => setDuration(Math.floor((Date.now() - start) / 1000)), 250);
+      });
+      call.on('disconnect', () => {
+        setCallStatus('awaiting_outcome');
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      });
+      call.on('cancel', () => setCallStatus('awaiting_outcome'));
+      call.on('reject', () => setCallStatus('awaiting_outcome'));
+      call.on('error', (err) => {
+        setCallStatus('error');
+        setErrorMsg(err?.message || 'Call error');
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      });
+    } catch (e) {
+      setCallStatus('error');
+      setErrorMsg(e?.message || 'Failed to start');
+    }
+  }
+
+  function hangup() { if (callRef.current) try { callRef.current.disconnect(); } catch {} }
+  function toggleMute() {
+    if (callRef.current) {
+      const n = !isMuted;
+      try { callRef.current.mute(n); setIsMuted(n); } catch {}
+    }
+  }
+
+  async function chooseOutcome(outcome) {
+    const meta = DIALER_OUTCOMES.find(o => o.value === outcome);
+    dispatch({ type: 'LOG_DIAL_OUTCOME', outcome });
+
+    // Persist outcome + notes on the calls row
+    if (sidRef.current) {
+      await supabase.from('calls').update({
+        outcome,
+        notes: notes.trim() || null,
+      }).eq('twilio_call_sid', sidRef.current);
+    }
+
+    // Side-effects on the account
+    if (current?.accountId && meta) {
+      const patch = { updated_by: state.profile.id };
+      if (meta.nextBumpDays) {
+        const d = new Date(); d.setDate(d.getDate() + meta.nextBumpDays);
+        patch.next_contact_date = d.toISOString().slice(0, 10);
+      }
+      if (meta.stage) patch.deal_stage = meta.stage;
+      if (outcome === 'bad_number') patch.next_contact_date = null;
+
+      const { data: acct } = await supabase.from('accounts').update(patch).eq('id', current.accountId).select().single();
+      if (acct) dispatch({ type: 'UPSERT_ACCOUNT', account: acct });
+    }
+
+    // Callback → open task modal for follow-up scheduling
+    if (meta?.openTask && current?.accountId) {
+      dispatch({ type: 'OPEN_MODAL', modal: 'create_task', props: { accountId: current.accountId } });
+    }
+
+    // Auto-advance
+    if (autoAdvance > 0) {
+      let s = autoAdvance;
+      setCountdown(s);
+      countdownRef.current = setInterval(() => {
+        s -= 1;
+        if (s <= 0) {
+          teardownCountdown();
+          dispatch({ type: 'ADVANCE_DIAL_QUEUE' });
+        } else {
+          setCountdown(s);
+        }
+      }, 1000);
+    } else {
+      dispatch({ type: 'ADVANCE_DIAL_QUEUE' });
+    }
+  }
+
+  function skipCurrent() {
+    teardownCountdown();
+    teardownCall();
+    dispatch({ type: 'ADVANCE_DIAL_QUEUE' });
+  }
+  function pause() {
+    teardownCountdown();
+    dispatch({ type: 'PAUSE_DIAL_QUEUE' });
+  }
+  function resume() {
+    teardownCountdown();
+    dispatch({ type: 'RESUME_DIAL_QUEUE' });
+  }
+  function stop() {
+    teardownCountdown();
+    teardownCall();
+    dispatch({ type: 'STOP_DIAL_QUEUE' });
+  }
+
+  // Auto-save notes on the in-progress call as user types (debounced)
+  useEffect(() => {
+    if (!sidRef.current || !notes) return;
+    const t = setTimeout(() => {
+      supabase.from('calls').update({ notes: notes.trim() || null }).eq('twilio_call_sid', sidRef.current);
+    }, 1000);
+    return () => clearTimeout(t);
+  }, [notes]);
+
+  // ---- render ----------------------------------------------------------
+  if (!q && !open) {
+    // Idle pin — small tab on the right edge that opens an empty panel
+    return (
+      <button
+        onClick={() => dispatch({ type: 'TOGGLE_DIALER_PANEL' })}
+        className="fixed right-0 top-1/2 -translate-y-1/2 z-30 bg-gray-900 text-white px-2 py-3 rounded-l text-xs writing-mode-vertical hover:bg-gray-700"
+        style={{ writingMode: 'vertical-rl' }}
+        title="Open power dialer">
+        📞 Dialer
+      </button>
+    );
+  }
+
+  return (
+    <div className="border-l border-gray-200 bg-white flex flex-col" style={{ width: '360px' }}>
+      <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold text-gray-900">📞 Power dialer</span>
+          {q && <span className="text-xs text-gray-500">{q.position + (q.status === 'done' ? 0 : 1)} of {q.items.length}</span>}
+        </div>
+        <button onClick={() => dispatch({ type: 'TOGGLE_DIALER_PANEL' })} className="text-gray-400 hover:text-gray-700 text-lg leading-none">−</button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto scrollbar-thin p-3 space-y-3">
+        {!q && (
+          <div className="text-sm text-gray-600 space-y-2">
+            <p>No active queue.</p>
+            <p className="text-xs">Click <b>Start dialing</b> on the Accounts, Contacts, or Tasks list to begin. The queue follows whatever filter and sort you have applied.</p>
+          </div>
+        )}
+
+        {q && q.status === 'done' && (
+          <div className="space-y-3">
+            <div className="text-center">
+              <div className="text-3xl mb-1">🎉</div>
+              <div className="text-base font-semibold text-gray-900">Queue complete</div>
+              <div className="text-xs text-gray-500">{q.items.length} of {q.items.length} done</div>
+            </div>
+            <div className="bg-gray-50 border border-gray-200 rounded p-3 text-sm space-y-1">
+              {DIALER_OUTCOMES.map(o => (
+                <div key={o.value} className="flex justify-between">
+                  <span className="text-gray-700">{o.label}</span>
+                  <span className="font-medium text-gray-900">{q.outcomeCounts[o.value] || 0}</span>
+                </div>
+              ))}
+            </div>
+            <Button className="w-full justify-center" onClick={stop}>Close</Button>
+          </div>
+        )}
+
+        {q && q.status !== 'done' && current && (
+          <>
+            <div className="bg-gray-50 border border-gray-200 rounded p-3">
+              <div className="text-xs text-gray-500">Calling</div>
+              <div className="text-base font-semibold text-gray-900 truncate">
+                {current.contactName || current.accountName || formatPhone(current.phone)}
+              </div>
+              {current.contactName && current.accountName && (
+                <div className="text-xs text-gray-600 truncate">{current.accountName}</div>
+              )}
+              <div className="text-sm text-gray-700 mt-1">{formatPhone(current.phone)}</div>
+              {current.accountId && (
+                <a href={`#/accounts/${current.accountId}`} className="text-xs text-blue-600 hover:underline">Open account →</a>
+              )}
+            </div>
+
+            <div className="min-h-[1.25rem] text-sm">
+              {callStatus === 'idle'         && state.twilio.status !== 'ready' && <span className="text-gray-600">Initializing phone…</span>}
+              {callStatus === 'connecting'   && <span className="text-blue-700">Dialing…</span>}
+              {callStatus === 'on_call'      && <span className="text-green-700">● Connected · {fmtDur(duration)}</span>}
+              {callStatus === 'awaiting_outcome' && <span className="text-gray-700">Call ended{duration > 0 ? ` · ${fmtDur(duration)}` : ''}</span>}
+              {callStatus === 'error'        && <span className="text-red-700">Error: {errorMsg}</span>}
+            </div>
+
+            {(callStatus === 'connecting' || callStatus === 'on_call') && (
+              <div className="flex gap-2">
+                <Button variant="secondary" className="flex-1 justify-center" onClick={toggleMute}>{isMuted ? 'Unmute' : 'Mute'}</Button>
+                <Button variant="danger" className="flex-1 justify-center" onClick={hangup}>Hang up</Button>
+              </div>
+            )}
+
+            <Textarea
+              label="Notes (auto-saves)"
+              rows={4}
+              value={notes}
+              onChange={e => setNotes(e.target.value)}
+              placeholder="Type as you talk…"
+            />
+
+            {callStatus === 'awaiting_outcome' && countdown == null && (
+              <div className="space-y-1">
+                <div className="text-xs text-gray-500 mb-1">Outcome</div>
+                {DIALER_OUTCOMES.map(o => (
+                  <button key={o.value} onClick={() => chooseOutcome(o.value)}
+                    className="w-full text-left px-3 py-1.5 text-sm rounded border border-gray-200 hover:bg-gray-50 hover:border-gray-300">
+                    {o.label}
+                  </button>
+                ))}
+                <button onClick={skipCurrent}
+                  className="w-full text-left px-3 py-1.5 text-sm rounded text-gray-500 hover:bg-gray-50">
+                  Skip without logging →
+                </button>
+              </div>
+            )}
+
+            {countdown != null && (
+              <div className="bg-blue-50 border border-blue-200 rounded p-3 text-sm flex items-center justify-between">
+                <span className="text-blue-900">Next call in {countdown}s…</span>
+                <button onClick={teardownCountdown} className="text-xs text-blue-700 hover:underline">Cancel</button>
+              </div>
+            )}
+
+            {upcoming.length > 0 && (
+              <div className="pt-2 border-t border-gray-200">
+                <div className="text-xs text-gray-500 mb-1">Coming up</div>
+                <ol className="text-xs text-gray-700 space-y-0.5">
+                  {upcoming.map((u, i) => (
+                    <li key={i} className="truncate">{q.position + 2 + i}. {u.contactName || u.accountName || formatPhone(u.phone)}</li>
+                  ))}
+                </ol>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {q && q.status !== 'done' && (
+        <div className="border-t border-gray-200 p-2 flex items-center gap-2">
+          {q.status === 'paused' ? (
+            <Button size="sm" className="flex-1 justify-center" onClick={resume}>Resume</Button>
+          ) : (
+            <Button size="sm" variant="secondary" className="flex-1 justify-center" onClick={pause}>Pause</Button>
+          )}
+          <Button size="sm" variant="ghost" className="flex-1 justify-center" onClick={skipCurrent}>Skip</Button>
+          <Button size="sm" variant="danger" className="flex-1 justify-center" onClick={stop}>Stop</Button>
+        </div>
+      )}
+
+      {q && (
+        <div className="border-t border-gray-200 px-3 py-2 text-xs text-gray-600 flex items-center gap-2">
+          <span>Auto-advance:</span>
+          <input
+            type="number"
+            min="0" max="60"
+            value={autoAdvance}
+            onChange={e => { const n = Math.max(0, Math.min(60, parseInt(e.target.value || '0', 10))); setAutoAdvance(n); saveAutoAdvance(n); }}
+            className="w-14 px-2 py-0.5 border border-gray-300 rounded text-sm"
+          />
+          <span>seconds</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Helper: open the dialer modal from anywhere with a clean payload.
 function openDialer(dispatch, { to, accountId, contactId, accountName, contactName }) {
   const e164 = (() => {
@@ -4699,19 +5178,24 @@ function App() {
     <AppCtx.Provider value={ctx}>
       <div className="h-full flex flex-col">
         <TopBar />
-        {state.route.name === 'calendar'
-          ? <CalendarView />
-          : state.route.name === 'detail'
-            ? <AccountDetailView accountId={state.route.accountId} />
-            : state.route.tab === 'contacts'
-              ? <ContactListView />
-              : state.route.tab === 'tasks'
-                ? <TaskListView />
-                : state.route.tab === 'activity'
-                  ? <ActivityListView />
-                  : state.route.tab === 'dashboard'
-                    ? <DashboardView />
-                    : <AccountListView />}
+        <div className="flex-1 flex overflow-hidden">
+          <div className="flex-1 flex flex-col overflow-hidden">
+            {state.route.name === 'calendar'
+              ? <CalendarView />
+              : state.route.name === 'detail'
+                ? <AccountDetailView accountId={state.route.accountId} />
+                : state.route.tab === 'contacts'
+                  ? <ContactListView />
+                  : state.route.tab === 'tasks'
+                    ? <TaskListView />
+                    : state.route.tab === 'activity'
+                      ? <ActivityListView />
+                      : state.route.tab === 'dashboard'
+                        ? <DashboardView />
+                        : <AccountListView />}
+          </div>
+          <DialerSidebar />
+        </div>
       </div>
       {state.modal === 'add_account' && <AddAccountModal />}
       {state.modal === 'add_contact' && <ContactModal />}
