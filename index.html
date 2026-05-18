@@ -3749,14 +3749,21 @@ function DialerModal() {
     if (data) dispatch({ type: 'UPSERT_ACCOUNT', account: data });
   }
 
-  async function closeModal() {
+  function closeModal() {
     teardown();
-    await persistNotes();
-    await refreshAccount();
-    // Reload the user's recent calls so the new row shows in the master list / sub-tab.
-    const { data: cls } = await supabase.from('calls').select('*').order('started_at', { ascending: false }).limit(1000);
-    if (cls) dispatch({ type: 'SET_ALL_CALLS', calls: cls });
+    // Close the modal immediately; run network cleanup in the background so a
+    // slow Supabase response can never block the close.
     dispatch({ type: 'CLOSE_MODAL' });
+    (async () => {
+      try {
+        await persistNotes();
+        await refreshAccount();
+        const { data: cls } = await supabase.from('calls').select('*').order('started_at', { ascending: false }).limit(1000);
+        if (cls) dispatch({ type: 'SET_ALL_CALLS', calls: cls });
+      } catch (e) {
+        console.error('[dialer] post-close cleanup failed', e);
+      }
+    })();
   }
 
   async function dial() {
@@ -3913,6 +3920,13 @@ function EmailModal() {
   const [status, setStatus] = useState('idle'); // idle | sending | sent | error
   const [errorMsg, setErrorMsg] = useState('');
 
+  function withTimeout(promise, ms, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)),
+    ]);
+  }
+
   async function send() {
     if (!to.trim()) { setStatus('error'); setErrorMsg('Recipient required.'); return; }
     if (!state.googleConnected) {
@@ -3922,30 +3936,37 @@ function EmailModal() {
     }
     setStatus('sending'); setErrorMsg('');
     try {
-      const sent = await gmail.send({
+      const sent = await withTimeout(gmail.send({
         to: to.trim(),
         subject: subject.trim(),
         body,
         threadId: replyToActivity?.gmail_thread_id || null,
         replyToMessageId: replyToActivity?.gmail_message_id || null,
-      });
+      }), 20000, 'Gmail send');
 
-      const { data: activity, error } = await supabase.from('activities').insert({
-        account_id: accountId,
-        contact_id: contactId || null,
-        user_id: state.profile.id,
-        type: 'email',
-        subject: subject.trim() || '(no subject)',
-        body,
-        occurred_at: new Date().toISOString(),
-        gmail_thread_id: sent.threadId || null,
-        gmail_message_id: sent.id || null,
-        email_to: to.trim(),
-        email_from: state.user.email || null,
-        email_subject: subject.trim() || null,
-      }).select().single();
-      if (error) throw new Error(error.message);
-      if (activity) dispatch({ type: 'ADD_ACTIVITY', activity });
+      // Log the activity but don't let a slow Supabase response leave the
+      // modal stuck — cap the wait and continue if it overruns.
+      try {
+        const insertPromise = supabase.from('activities').insert({
+          account_id: accountId,
+          contact_id: contactId || null,
+          user_id: state.profile.id,
+          type: 'email',
+          subject: subject.trim() || '(no subject)',
+          body,
+          occurred_at: new Date().toISOString(),
+          gmail_thread_id: sent.threadId || null,
+          gmail_message_id: sent.id || null,
+          email_to: to.trim(),
+          email_from: state.user.email || null,
+          email_subject: subject.trim() || null,
+        }).select().single();
+        const { data: activity, error } = await withTimeout(insertPromise, 10000, 'Activity log');
+        if (error) console.error('[email] activity insert failed', error);
+        else if (activity) dispatch({ type: 'ADD_ACTIVITY', activity });
+      } catch (logErr) {
+        console.error('[email] activity log skipped', logErr);
+      }
 
       setStatus('sent');
       notify(dispatch, 'Email sent.');
