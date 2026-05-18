@@ -5413,6 +5413,7 @@ function DialerModal() {
       call.on('disconnect', () => {
         setStatus('ended');
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+        if (accountId) autoAdvanceCadenceOnActivity({ accountId, activityType: 'call', state, dispatch });
       });
       call.on('cancel', () => {
         setStatus('ended');
@@ -5571,20 +5572,52 @@ async function enrollAccountInCadence({ accountId, cadenceId, state, dispatch })
   return enrollment;
 }
 
+// Auto-complete a cadence task when the rep does the matching activity.
+// Called from the dialer (call step) + email modal (personal_email step).
+async function autoAdvanceCadenceOnActivity({ accountId, activityType, state, dispatch }) {
+  if (!accountId || !activityType) return false;
+  const enrollment = state.cadenceEnrollments.find(e =>
+    e.account_id === accountId && e.status === 'active' && e.current_task_id
+  );
+  if (!enrollment) return false;
+  const steps = getCadenceStepsFor(state, enrollment.cadence_id);
+  const currentStep = steps.find(s => s.step_order === enrollment.current_step_order);
+  if (!currentStep || currentStep.step_type !== activityType) return false;
+  const task = state.allTasks.find(t => t.id === enrollment.current_task_id);
+  if (task?.completed_at) return false;
+
+  const completedAt = new Date().toISOString();
+  const { data, error } = await supabase.from('tasks')
+    .update({ completed_at: completedAt })
+    .eq('id', enrollment.current_task_id)
+    .select().single();
+  if (error) { console.error('[cadence-auto] task done failed:', error.message); return false; }
+  if (data) dispatch({ type: 'UPSERT_TASK', task: data });
+  await advanceCadenceFromCompletedTask({ taskId: enrollment.current_task_id, state, dispatch });
+  notify(dispatch, '🪜 Cadence step auto-completed');
+  return true;
+}
+
 async function advanceCadenceFromCompletedTask({ taskId, state, dispatch }) {
   const enrollment = state.cadenceEnrollments.find(e =>
     e.current_task_id === taskId && e.status === 'active'
   );
-  if (!enrollment) return;
+  if (!enrollment) {
+    console.log('[cadence] no active enrollment for task', taskId);
+    return { ok: false, reason: 'no_enrollment' };
+  }
   const cadence = state.cadences.find(c => c.id === enrollment.cadence_id);
   const account = state.accounts.find(a => a.id === enrollment.account_id);
-  if (!cadence || !account) return;
+  if (!cadence || !account) {
+    console.error('[cadence] missing cadence or account for enrollment', enrollment.id);
+    return { ok: false, reason: 'missing_cadence_or_account' };
+  }
 
   const steps = getCadenceStepsFor(state, enrollment.cadence_id);
   const currentStep = steps.find(s => s.step_order === enrollment.current_step_order);
 
   if (currentStep) {
-    const { data: exec } = await supabase.from('cadence_step_executions').insert({
+    const { data: exec, error: eErr } = await supabase.from('cadence_step_executions').insert({
       enrollment_id: enrollment.id,
       step_order: currentStep.step_order,
       step_type: currentStep.step_type,
@@ -5592,29 +5625,44 @@ async function advanceCadenceFromCompletedTask({ taskId, state, dispatch }) {
       task_id: taskId,
       skipped: false,
     }).select().single();
-    if (exec) dispatch({ type: 'ADD_CADENCE_EXECUTION', execution: exec });
+    if (eErr) console.error('[cadence] execution log failed:', eErr.message);
+    else if (exec) dispatch({ type: 'ADD_CADENCE_EXECUTION', execution: exec });
   }
 
   const nextStep = steps.find(s => s.step_order === enrollment.current_step_order + 1);
 
   if (!nextStep) {
-    const { data: updated } = await supabase.from('cadence_enrollments')
+    const { data: updated, error: uErr } = await supabase.from('cadence_enrollments')
       .update({ status: 'completed', completed_at: new Date().toISOString(), current_task_id: null })
       .eq('id', enrollment.id).select().single();
+    if (uErr) {
+      console.error('[cadence] enrollment complete failed:', uErr.message);
+      return { ok: false, reason: 'enrollment_update_failed', error: uErr.message };
+    }
     if (updated) dispatch({ type: 'UPSERT_CADENCE_ENROLLMENT', enrollment: updated });
-    return;
+    return { ok: true, completed: true };
   }
 
   const nextTaskPayload = buildCadenceTaskPayload(nextStep, cadence, account, state.profile.id);
   const { data: nextTask, error: tErr } = await supabase.from('tasks').insert(nextTaskPayload).select().single();
-  if (tErr) { console.error('[cadence] advance failed:', tErr.message); return; }
+  if (tErr) {
+    console.error('[cadence] next task insert failed:', tErr.message, tErr);
+    notify(dispatch, 'Cadence advance failed: ' + tErr.message, 'error');
+    return { ok: false, reason: 'next_task_failed', error: tErr.message };
+  }
 
-  const { data: updated } = await supabase.from('cadence_enrollments')
+  const { data: updated, error: uErr } = await supabase.from('cadence_enrollments')
     .update({ current_step_order: nextStep.step_order, current_task_id: nextTask.id })
     .eq('id', enrollment.id).select().single();
+  if (uErr) {
+    console.error('[cadence] enrollment advance failed:', uErr.message);
+    notify(dispatch, 'Cadence advance failed: ' + uErr.message, 'error');
+    return { ok: false, reason: 'enrollment_update_failed', error: uErr.message };
+  }
 
   if (nextTask) dispatch({ type: 'UPSERT_TASK', task: nextTask });
   if (updated) dispatch({ type: 'UPSERT_CADENCE_ENROLLMENT', enrollment: updated });
+  return { ok: true, nextStep, nextTask };
 }
 
 async function stopCadenceEnrollment({ enrollmentId, state, dispatch }) {
@@ -5831,10 +5879,12 @@ function CadenceListView() {
     if (!row.currentTask) return;
     const completedAt = new Date().toISOString();
     const { data, error } = await supabase.from('tasks').update({ completed_at: completedAt }).eq('id', row.currentTask.id).select().single();
-    if (error) return notify(dispatch, error.message, 'error');
+    if (error) return notify(dispatch, 'Mark done failed: ' + error.message, 'error');
     if (data) dispatch({ type: 'UPSERT_TASK', task: data });
-    await advanceCadenceFromCompletedTask({ taskId: row.currentTask.id, state, dispatch });
-    notify(dispatch, 'Step complete — cadence advanced.');
+    const result = await advanceCadenceFromCompletedTask({ taskId: row.currentTask.id, state, dispatch });
+    if (result?.ok && result.completed) notify(dispatch, '🎉 Cadence complete!');
+    else if (result?.ok) notify(dispatch, 'Step complete — cadence advanced');
+    // error case already notified inside advanceCadenceFromCompletedTask
   }
 
   async function runReportNow(row) {
@@ -6128,6 +6178,7 @@ function DialerSidebar() {
       call.on('disconnect', () => {
         setCallStatus('awaiting_outcome');
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+        if (current?.accountId) autoAdvanceCadenceOnActivity({ accountId: current.accountId, activityType: 'call', state, dispatch });
       });
       call.on('cancel', () => setCallStatus('awaiting_outcome'));
       call.on('reject', () => setCallStatus('awaiting_outcome'));
@@ -6464,6 +6515,10 @@ function EmailModal() {
 
       setStatus('sent');
       notify(dispatch, 'Email sent.');
+      // Auto-advance any active cadence whose current step is personal_email for this account
+      if (accountId) {
+        try { await autoAdvanceCadenceOnActivity({ accountId, activityType: 'personal_email', state, dispatch }); } catch {}
+      }
       setTimeout(() => dispatch({ type: 'CLOSE_MODAL' }), 600);
     } catch (e) {
       setStatus('error');
