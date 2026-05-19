@@ -5356,9 +5356,27 @@ function DialerModal() {
   }
 
   async function persistNotes() {
+    const trimmed = notes.trim();
+    if (!trimmed) return;
+    // 1) Save to the calls row (keyed by Twilio Call SID)
     const sid = sidRef.current;
-    if (!sid || !notes.trim()) return;
-    await supabase.from('calls').update({ notes: notes.trim() }).eq('twilio_call_sid', sid);
+    if (sid) {
+      await supabase.from('calls').update({ notes: trimmed }).eq('twilio_call_sid', sid);
+    }
+    // 2) Append to account.notes with a timestamp so the Notes tab on the
+    //    account becomes a running call-history log.
+    if (accountId) {
+      const { data: acct } = await supabase.from('accounts').select('notes').eq('id', accountId).single();
+      const ts = new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+      const who = contactName ? ` with ${contactName}` : '';
+      const entry = `[${ts}] Call${who}:\n${trimmed}`;
+      const prefix = (acct?.notes || '').trim();
+      const newNotes = prefix ? `${prefix}\n\n${entry}` : entry;
+      const { data: updated } = await supabase.from('accounts')
+        .update({ notes: newNotes, updated_by: state.profile.id })
+        .eq('id', accountId).select().single();
+      if (updated) dispatch({ type: 'UPSERT_ACCOUNT', account: updated });
+    }
   }
 
   async function refreshAccount() {
@@ -6205,15 +6223,18 @@ function DialerSidebar() {
     const meta = DIALER_OUTCOMES.find(o => o.value === outcome);
     dispatch({ type: 'LOG_DIAL_OUTCOME', outcome });
 
+    const trimmedNotes = notes.trim();
+
     // Persist outcome + notes on the calls row
     if (sidRef.current) {
       await supabase.from('calls').update({
         outcome,
-        notes: notes.trim() || null,
+        notes: trimmedNotes || null,
       }).eq('twilio_call_sid', sidRef.current);
     }
 
-    // Side-effects on the account
+    // Side-effects on the account: next_contact_date, stage move, and
+    // a running log of the call notes appended to account.notes.
     if (current?.accountId && meta) {
       const patch = { updated_by: state.profile.id };
       if (meta.nextBumpDays) {
@@ -6222,6 +6243,19 @@ function DialerSidebar() {
       }
       if (meta.stage) patch.deal_stage = meta.stage;
       if (outcome === 'bad_number') patch.next_contact_date = null;
+
+      // Append call notes (+ outcome) to account.notes
+      if (trimmedNotes || meta.label) {
+        const { data: acctRow } = await supabase.from('accounts').select('notes').eq('id', current.accountId).single();
+        const ts = new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+        const who = current.contactName ? ` with ${current.contactName}` : '';
+        const outcomeLabel = meta.label.replace(/^\S+\s/, ''); // strip emoji prefix
+        const entry = trimmedNotes
+          ? `[${ts}] Call${who} — ${outcomeLabel}:\n${trimmedNotes}`
+          : `[${ts}] Call${who} — ${outcomeLabel}`;
+        const prefix = (acctRow?.notes || '').trim();
+        patch.notes = prefix ? `${prefix}\n\n${entry}` : entry;
+      }
 
       const { data: acct } = await supabase.from('accounts').update(patch).eq('id', current.accountId).select().single();
       if (acct) dispatch({ type: 'UPSERT_ACCOUNT', account: acct });
