@@ -5959,6 +5959,40 @@ function CadenceListView() {
     // error case already notified inside advanceCadenceFromCompletedTask
   }
 
+  function getPrimaryContact(account) {
+    if (!account) return null;
+    const contacts = state.allContacts.filter(c => c.account_id === account.id);
+    return contacts.find(c => c.is_primary) || contacts[0] || null;
+  }
+
+  function startCall(row) {
+    if (!row.account) return;
+    const primary = getPrimaryContact(row.account);
+    const phone = primary?.phone || primary?.mobile || row.account.phone;
+    if (!phone) return notify(dispatch, 'No phone on primary contact or account.', 'error');
+    openDialer(dispatch, {
+      to: phone,
+      accountId: row.account.id,
+      contactId: primary?.id || null,
+      accountName: row.account.name,
+      contactName: primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null,
+    });
+  }
+
+  function composeEmail(row) {
+    if (!row.account) return;
+    const primary = getPrimaryContact(row.account);
+    const defaultTo = primary?.email || row.account.email || '';
+    if (!defaultTo) return notify(dispatch, 'No email on primary contact or account.', 'error');
+    openEmail(dispatch, {
+      accountId: row.account.id,
+      contactId: primary?.id || null,
+      accountName: row.account.name,
+      contactName: primary ? `${primary.first_name} ${primary.last_name || ''}`.trim() : null,
+      defaultTo,
+    });
+  }
+
   async function runReportNow(row) {
     if (!row.currentTask || !row.account) return;
     const account = row.account;
@@ -6052,6 +6086,12 @@ function CadenceListView() {
                     </td>
                     <td className="px-3 py-2 text-sm text-gray-700 whitespace-nowrap">{r.rep?.full_name || '—'}</td>
                     <td className="px-3 py-2 text-right whitespace-nowrap">
+                      {!isComplete && r.currentTask && r.currentStep?.step_type === 'call' && (
+                        <Button size="sm" className="mr-1" onClick={() => startCall(r)}>📞 Call</Button>
+                      )}
+                      {!isComplete && r.currentTask && r.currentStep?.step_type === 'personal_email' && (
+                        <Button size="sm" className="mr-1" onClick={() => composeEmail(r)}>✉ Email</Button>
+                      )}
                       {!isComplete && r.currentTask && r.currentStep?.step_type === 'auto_email_report' && (
                         <Button size="sm" className="mr-1" onClick={() => runReportNow(r)}>📊 Run report</Button>
                       )}
