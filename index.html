@@ -5566,25 +5566,35 @@ async function enrollAccountInCadence({ accountId, cadenceId, state, dispatch })
   const steps = getCadenceStepsFor(state, cadenceId);
   if (!steps.length) throw new Error('Cadence has no steps');
 
-  // Timeout wrapper so a hung Supabase call can never lock the modal forever.
+  // Tight timeouts so a hung Supabase call surfaces fast. Each step logs
+  // before/after so DevTools shows exactly where a hang occurs.
   const withTimeout = (p, ms, label) => Promise.race([
     p,
     new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timed out after ${ms / 1000}s`)), ms)),
   ]);
+  const step = async (label, ms, p) => {
+    console.log('[cadence] ▶', label);
+    const t0 = performance.now();
+    try {
+      const result = await withTimeout(p, ms, label);
+      console.log('[cadence] ✓', label, `(${Math.round(performance.now() - t0)}ms)`);
+      return result;
+    } catch (e) {
+      console.error('[cadence] ✗', label, `(${Math.round(performance.now() - t0)}ms)`, e);
+      throw e;
+    }
+  };
 
   // Pre-flight: an existing (account_id, cadence_id) row would hit the unique
   // constraint. Detect it now and either reject (if still active) or clean it
   // up (if completed/opted_out) so the rep can re-enroll.
-  const { data: existing, error: existErr } = await withTimeout(
+  const { data: existing, error: existErr } = await step(
+    'Existing-enrollment check', 4000,
     supabase.from('cadence_enrollments')
       .select('id, status, current_task_id')
-      .eq('account_id', accountId).eq('cadence_id', cadenceId).maybeSingle(),
-    10000, 'Existing-enrollment check'
+      .eq('account_id', accountId).eq('cadence_id', cadenceId).maybeSingle()
   );
-  if (existErr) {
-    console.error('[cadence] pre-flight failed:', existErr);
-    throw new Error('Pre-flight: ' + existErr.message);
-  }
+  if (existErr) throw new Error('Pre-flight: ' + existErr.message);
   if (existing) {
     if (existing.status === 'active') {
       throw new Error('This account is already actively enrolled in this cadence. Stop the existing cadence first.');
@@ -5592,34 +5602,22 @@ async function enrollAccountInCadence({ accountId, cadenceId, state, dispatch })
     // Inactive (completed / opted_out): delete the old row so we can re-enroll.
     if (existing.current_task_id) {
       try {
-        await withTimeout(
-          supabase.from('tasks').delete().eq('id', existing.current_task_id),
-          10000, 'Old-task delete'
-        );
-      } catch (e) { console.warn('[cadence] old task delete:', e.message); }
+        await step('Old-task delete', 4000,
+          supabase.from('tasks').delete().eq('id', existing.current_task_id));
+      } catch (e) { console.warn('[cadence] old task delete swallowed:', e.message); }
       dispatch({ type: 'REMOVE_TASK', id: existing.current_task_id });
     }
-    const { error: delErr } = await withTimeout(
-      supabase.from('cadence_enrollments').delete().eq('id', existing.id),
-      10000, 'Old-enrollment delete'
-    );
-    if (delErr) {
-      console.error('[cadence] old enrollment delete failed:', delErr);
-      throw new Error('Failed to clean up previous enrollment: ' + delErr.message);
-    }
+    const { error: delErr } = await step('Old-enrollment delete', 4000,
+      supabase.from('cadence_enrollments').delete().eq('id', existing.id));
+    if (delErr) throw new Error('Failed to clean up previous enrollment: ' + delErr.message);
     dispatch({ type: 'REMOVE_CADENCE_ENROLLMENT', id: existing.id });
   }
 
   // Create the first task
   const taskPayload = buildCadenceTaskPayload(steps[0], cadence, account, state.profile.id);
-  const { data: task, error: tErr } = await withTimeout(
-    supabase.from('tasks').insert(taskPayload).select().single(),
-    15000, 'Task insert'
-  );
-  if (tErr) {
-    console.error('[cadence] enroll task insert failed:', tErr);
-    throw new Error('Task insert: ' + tErr.message);
-  }
+  const { data: task, error: tErr } = await step('Task insert', 4000,
+    supabase.from('tasks').insert(taskPayload).select().single());
+  if (tErr) throw new Error('Task insert: ' + tErr.message);
 
   // Create the enrollment
   const enrollPayload = {
@@ -5628,14 +5626,11 @@ async function enrollAccountInCadence({ accountId, cadenceId, state, dispatch })
     status: 'active', current_step_order: 1,
     current_task_id: task.id,
   };
-  const { data: enrollment, error: eErr } = await withTimeout(
-    supabase.from('cadence_enrollments').insert(enrollPayload).select().single(),
-    15000, 'Enrollment insert'
-  );
+  const { data: enrollment, error: eErr } = await step('Enrollment insert', 4000,
+    supabase.from('cadence_enrollments').insert(enrollPayload).select().single());
   if (eErr) {
-    console.error('[cadence] enrollment insert failed:', eErr);
     // Best-effort cleanup of the orphaned task. Don't let cleanup hang either.
-    try { await withTimeout(supabase.from('tasks').delete().eq('id', task.id), 5000, 'Task cleanup'); } catch {}
+    try { await step('Task cleanup', 3000, supabase.from('tasks').delete().eq('id', task.id)); } catch {}
     throw new Error('Enrollment insert: ' + eErr.message);
   }
 
@@ -5761,6 +5756,7 @@ function CadenceEnrollModal() {
 
   async function submit() {
     if (!cadenceId || !accountId) return;
+    console.log('[cadence] submit clicked', { accountId, cadenceId, profileId: state.profile?.id });
     setBusy(true);
     try {
       await enrollAccountInCadence({ accountId, cadenceId, state, dispatch });
@@ -5768,7 +5764,10 @@ function CadenceEnrollModal() {
       dispatch({ type: 'CLOSE_MODAL' });
     } catch (e) {
       const msg = e?.message || 'Enroll failed.';
-      notify(dispatch, msg.includes('unique') ? 'Already enrolled in this cadence.' : msg, 'error');
+      const friendly = msg.includes('unique') ? 'Already enrolled in this cadence.' : msg;
+      console.error('[cadence] enrollment failed:', e);
+      notify(dispatch, friendly, 'error');
+      alert('Enroll failed: ' + friendly);
     } finally { setBusy(false); }
   }
 
