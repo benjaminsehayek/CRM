@@ -1,0 +1,5 @@
+# Local Claude Code agent settings
+.claude/
+
+# Supabase CLI local state (linked project ref, cli version cache)
+supabase/.temp/

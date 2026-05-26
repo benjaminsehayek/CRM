@@ -1,0 +1,15 @@
+# Supabase project configuration.
+# Generated for project ref zljokoskuokybdiqqhpy (CRM).
+
+project_id = "zljokoskuokybdiqqhpy"
+
+# The Twilio Voice webhooks (/voice, /inbound, /status, /recording-complete,
+# /transcription-complete) are called by Twilio's servers, which send an
+# X-Twilio-Signature header but NOT a Supabase JWT. With the gateway's default
+# JWT verification on, every Twilio callback is rejected with 401 before our
+# handler runs, and Twilio speaks "an application error has occurred" (error
+# 11200). Disable gateway JWT verification and rely on:
+#   - /token: validates the Supabase JWT itself (admin.auth.getUser)
+#   - webhooks: Twilio request-signature verification (verifyTwilioSignature)
+[functions.twilio-voice]
+verify_jwt = false
