@@ -5361,21 +5361,20 @@ function DialerModal() {
     // 1) Save to the calls row (keyed by Twilio Call SID)
     const sid = sidRef.current;
     if (sid) {
-      await supabase.from('calls').update({ notes: trimmed }).eq('twilio_call_sid', sid);
+      const { error: callErr } = await supabase.from('calls').update({ notes: trimmed }).eq('twilio_call_sid', sid);
+      if (callErr) console.error('[dialer] calls.notes update failed', callErr);
     }
-    // 2) Append to account.notes with a timestamp so the Notes tab on the
-    //    account becomes a running call-history log.
+    // 2) Append to account.notes via the append_call_note RPC. The function
+    //    is SECURITY DEFINER + atomic, so a rep covering a teammate's account
+    //    isn't blocked by accounts_update RLS, and back-to-back calls can't
+    //    clobber each other's entries with a read-modify-write race.
     if (accountId) {
-      const { data: acct } = await supabase.from('accounts').select('notes').eq('id', accountId).single();
       const ts = new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
       const who = contactName ? ` with ${contactName}` : '';
       const entry = `[${ts}] Call${who}:\n${trimmed}`;
-      const prefix = (acct?.notes || '').trim();
-      const newNotes = prefix ? `${prefix}\n\n${entry}` : entry;
-      const { data: updated } = await supabase.from('accounts')
-        .update({ notes: newNotes, updated_by: state.profile.id })
-        .eq('id', accountId).select().single();
-      if (updated) dispatch({ type: 'UPSERT_ACCOUNT', account: updated });
+      const { data: updated, error: noteErr } = await supabase.rpc('append_call_note', { p_account_id: accountId, p_entry: entry });
+      if (noteErr) console.error('[dialer] account.notes append failed', noteErr);
+      else if (updated) dispatch({ type: 'UPSERT_ACCOUNT', account: updated });
     }
   }
 
@@ -6326,8 +6325,11 @@ function DialerSidebar() {
       }).eq('twilio_call_sid', sidRef.current);
     }
 
-    // Side-effects on the account: next_contact_date, stage move, and
-    // a running log of the call notes appended to account.notes.
+    // Side-effects on the account, split in two so a non-owner rep still
+    // gets their call logged even if the stage/next-contact patch is
+    // RLS-blocked:
+    //   a) patch the owner-gated fields (deal_stage, next_contact_date)
+    //   b) atomically append the call entry to account.notes via RPC
     if (current?.accountId && meta) {
       const patch = { updated_by: state.profile.id };
       if (meta.nextBumpDays) {
@@ -6337,21 +6339,25 @@ function DialerSidebar() {
       if (meta.stage) patch.deal_stage = meta.stage;
       if (outcome === 'bad_number') patch.next_contact_date = null;
 
-      // Append call notes (+ outcome) to account.notes
+      // (a) Owner-gated patch — only deal_stage/next_contact_date here.
+      if (Object.keys(patch).length > 1) {
+        const { data: acct, error: patchErr } = await supabase.from('accounts').update(patch).eq('id', current.accountId).select().single();
+        if (patchErr) console.error('[dialer] account patch failed', patchErr);
+        if (acct) dispatch({ type: 'UPSERT_ACCOUNT', account: acct });
+      }
+
+      // (b) Notes append — SECURITY DEFINER RPC, atomic, RLS-safe.
       if (trimmedNotes || meta.label) {
-        const { data: acctRow } = await supabase.from('accounts').select('notes').eq('id', current.accountId).single();
         const ts = new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
         const who = current.contactName ? ` with ${current.contactName}` : '';
         const outcomeLabel = meta.label.replace(/^\S+\s/, ''); // strip emoji prefix
         const entry = trimmedNotes
           ? `[${ts}] Call${who} — ${outcomeLabel}:\n${trimmedNotes}`
           : `[${ts}] Call${who} — ${outcomeLabel}`;
-        const prefix = (acctRow?.notes || '').trim();
-        patch.notes = prefix ? `${prefix}\n\n${entry}` : entry;
+        const { data: updated, error: noteErr } = await supabase.rpc('append_call_note', { p_account_id: current.accountId, p_entry: entry });
+        if (noteErr) console.error('[dialer] account.notes append failed', noteErr);
+        else if (updated) dispatch({ type: 'UPSERT_ACCOUNT', account: updated });
       }
-
-      const { data: acct } = await supabase.from('accounts').update(patch).eq('id', current.accountId).select().single();
-      if (acct) dispatch({ type: 'UPSERT_ACCOUNT', account: acct });
     }
 
     // Callback → open task modal for follow-up scheduling
